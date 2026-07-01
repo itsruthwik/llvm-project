@@ -261,12 +261,19 @@ mlir::Value SCFLoop::findIVInitValue() {
   return nullptr;
 }
 
+// Forward decls: only break/continue that TARGET a given loop take it off the
+// canonical path (definitions are below, after the SCFLoop members).
+static bool loopHasTargetingBreak(mlir::Operation *loopOp);
+static bool loopHasTargetingContinue(mlir::Operation *loopOp);
+
 void SCFLoop::analysis() {
-  // Check whether this ForOp contains break or continue.
-  forOp.walk([&](mlir::Operation *op) {
-    if (isa<BreakOp, ContinueOp>(op))
-      hasBreakContinue = true;
-  });
+  // Only a break/continue that TARGETS this for-loop forces the non-canonical
+  // while path. A break/continue belonging to an INNER nested loop is that
+  // loop's concern and must not downgrade this (canonical) loop's lowering. A
+  // coarse subtree walk would wrongly route e.g. `for(i){ while(p){ continue; }}`
+  // through the fragile while-transform.
+  hasBreakContinue =
+      loopHasTargetingBreak(forOp) || loopHasTargetingContinue(forOp);
   if (hasBreakContinue) {
     canonical = false;
     return;
@@ -688,11 +695,19 @@ public:
           "ThroughMLIR: 'break' inside a loop is not yet supported by the "
           "CIR-to-MLIR lowering; rewrite the loop to avoid 'break' (e.g. with a "
           "flag/condition)");
-    if (loopHasTargetingContinue(op) && opIsNestedInLoop(op))
+    // Reject ANY 'continue' targeting this do-while (not just nested ones).
+    // Unlike CIRWhileOpLowering, the do path does not run rewriteContinue:
+    // SCFDoLoop::transferToSCFWhileOp merges the do body+cond into the scf.while
+    // "before" region, so the while-style rewriteContinue (which assumes the
+    // body is the scf "after" region) cannot be reused. Lowering it anyway would
+    // leave a stray cir.continue that fails the op verifier once the cir.do is
+    // erased. Reject honestly instead (consistent with 'for'+continue); flat
+    // while+continue remains supported.
+    if (loopHasTargetingContinue(op))
       return op.emitError(
-          "ThroughMLIR: 'continue' in a nested loop is not yet supported by the "
-          "CIR-to-MLIR lowering; flatten the loop nesting or rewrite without "
-          "'continue'");
+          "ThroughMLIR: 'continue' inside a 'do-while' loop is not yet "
+          "supported by the CIR-to-MLIR lowering; rewrite as a 'while' loop "
+          "with an explicit condition, or avoid 'continue'");
     SCFDoLoop loop(op, adaptor, &rewriter);
     loop.transferToSCFWhileOp();
     rewriter.eraseOp(op);

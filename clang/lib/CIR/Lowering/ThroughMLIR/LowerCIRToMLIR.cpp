@@ -850,6 +850,19 @@ public:
 // BinOpKind / UnaryOpKind enums) into per-op classes. So these are now one
 // OpConversionPattern per CIR op instead of a switch on a kind enum (D1/D2).
 
+// cir.add / cir.sub carry an optional 'saturated' unit flag (clamp to the
+// type's range instead of wrapping); the other binary ops do not. ThroughMLIR
+// lowers to plain wrapping arith.*, which would SILENTLY MISCOMPILE a saturating
+// op, so detect and reject it with an honest diagnostic. (CIRGen does not emit
+// saturating add/sub today, so this is defensive against a future gap.)
+static bool binOpIsSaturated(mlir::Operation *op) {
+  if (auto add = mlir::dyn_cast<cir::AddOp>(op))
+    return add.getSaturated();
+  if (auto sub = mlir::dyn_cast<cir::SubOp>(op))
+    return sub.getSaturated();
+  return false;
+}
+
 // Direct 1:1 binary lowering: cir.<op> %a, %b -> arith.<MLIROp> %a, %b.
 // Integer Add/Sub/Mul/And/Or/Xor and FP FAdd/FSub/FMul/FDiv/FRem.
 template <typename CIROp, typename MLIROp>
@@ -864,6 +877,9 @@ public:
     mlir::Type mlirType = this->getTypeConverter()->convertType(op.getType());
     if (!mlirType)
       return op.emitError("CIRBinOpLowering: unconvertible result type");
+    if (binOpIsSaturated(op))
+      return op.emitError("CIRBinOpLowering: saturating add/sub is not yet "
+                          "supported by the CIR-to-MLIR lowering");
     rewriter.replaceOpWithNewOp<MLIROp>(op, mlirType, adaptor.getLhs(),
                                         adaptor.getRhs());
     return mlir::success();
@@ -900,8 +916,10 @@ public:
   }
 };
 
-// Unary ++/-- : input +/- Delta, type-dispatched (CIR emits Inc/Dec for both
-// integer and floating-point operands).
+// Unary ++/-- : input +/- Delta. In this CIR version cir.inc/cir.dec are
+// integer(-or-vector-of-int)-only; floating-point ++/-- is emitted as
+// cir.fadd/cir.fsub, not Inc/Dec. The FloatType branch below is therefore
+// defensive/unreachable today but kept correct in case that constraint widens.
 template <typename CIROp, int64_t Delta>
 class CIRIncDecOpLowering : public mlir::OpConversionPattern<CIROp> {
 public:
@@ -939,6 +957,11 @@ public:
   matchAndRewrite(cir::MinusOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::Type type = getTypeConverter()->convertType(op.getType());
+    // cir.minus also accepts vector-of-int; the scalar IntegerAttr path below
+    // would hard-cast (assert/crash) on a vector type. Fail honestly instead.
+    if (!mlir::isa<mlir::IntegerType>(type))
+      return op.emitError("CIRMinusOpLowering: only scalar integer negation is "
+                          "supported (vector operands not yet handled)");
     auto zero = mlir::arith::ConstantOp::create(
         rewriter, op.getLoc(), mlir::IntegerAttr::get(type, 0));
     rewriter.replaceOpWithNewOp<mlir::arith::SubIOp>(op, type, zero,
@@ -969,6 +992,11 @@ public:
   matchAndRewrite(cir::NotOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::Type type = getTypeConverter()->convertType(op.getType());
+    // cir.not also accepts vector-of-int; the scalar IntegerAttr path below
+    // would hard-cast (assert/crash) on a vector type. Fail honestly instead.
+    if (!mlir::isa<mlir::IntegerType>(type))
+      return op.emitError("CIRNotOpLowering: only scalar integer bitwise-not is "
+                          "supported (vector operands not yet handled)");
     auto minusOne = mlir::arith::ConstantOp::create(
         rewriter, op.getLoc(), mlir::IntegerAttr::get(type, -1));
     rewriter.replaceOpWithNewOp<mlir::arith::XOrIOp>(op, type, minusOne,
