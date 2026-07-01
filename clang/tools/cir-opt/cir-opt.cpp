@@ -41,6 +41,11 @@ int main(int argc, char **argv) {
     return mlir::createCIRSimplifyPass();
   });
 
+  // CIR -> standard-MLIR (ThroughMLIR): the HLS front-end's --cir-to-mlir.
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return cir::createConvertCIRToMLIRPass();
+  });
+
   mlir::PassPipelineRegistration<CIRToLLVMPipelineOptions> pipeline(
       "cir-to-llvm", "",
       [](mlir::OpPassManager &pm, const CIRToLLVMPipelineOptions &options) {

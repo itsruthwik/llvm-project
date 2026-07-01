@@ -18,6 +18,11 @@
 #include <memory>
 
 namespace cir {
+
+/// Create a pass that lowers CIR to the standard MLIR dialects (scf, cf, func,
+/// arith, memref, vector, math). This is the "ThroughMLIR" path the HLS flow uses.
+std::unique_ptr<mlir::Pass> createConvertCIRToMLIRPass();
+
 namespace direct {
 /// Create a pass that fully lowers CIR to the LLVMIR dialect.
 std::unique_ptr<mlir::Pass> createConvertCIRToLLVMPass();

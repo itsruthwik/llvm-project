@@ -1,0 +1,101 @@
+#ifndef LLVM_CLANG_LIB_CIR_LOWERING_THROUGHMLIR_LOWERTOMLIRHELPERS_H
+#define LLVM_CLANG_LIB_CIR_LOWERING_THROUGHMLIR_LOWERTOMLIRHELPERS_H
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
+
+#include <cassert>
+
+namespace cir {
+
+template <typename T>
+inline mlir::Value getConst(mlir::ConversionPatternRewriter &rewriter,
+                            mlir::Location loc, mlir::Type ty, T value) {
+  assert((mlir::isa<mlir::IntegerType>(ty) || mlir::isa<mlir::FloatType>(ty)) &&
+         "expected integer or floating-point type");
+
+  if (mlir::isa<mlir::IntegerType>(ty))
+    return mlir::arith::ConstantOp::create(rewriter, loc, ty,
+                                           mlir::IntegerAttr::get(ty, value));
+
+  return mlir::arith::ConstantOp::create(rewriter, loc, ty,
+                                         mlir::FloatAttr::get(ty, value));
+}
+
+inline mlir::Value createIntCast(mlir::ConversionPatternRewriter &rewriter,
+                                 mlir::Value src, mlir::Type dstTy,
+                                 bool isSigned = false) {
+  auto srcTy = src.getType();
+  assert(mlir::isa<mlir::IntegerType>(srcTy) && "expected integer source type");
+  assert(mlir::isa<mlir::IntegerType>(dstTy) && "expected integer dest type");
+
+  auto srcWidth = llvm::cast<mlir::IntegerType>(srcTy).getWidth();
+  auto dstWidth = llvm::cast<mlir::IntegerType>(dstTy).getWidth();
+  auto loc = src.getLoc();
+
+  if (dstWidth > srcWidth && isSigned)
+    return mlir::arith::ExtSIOp::create(rewriter, loc, dstTy, src);
+  if (dstWidth > srcWidth)
+    return mlir::arith::ExtUIOp::create(rewriter, loc, dstTy, src);
+  if (dstWidth < srcWidth)
+    return mlir::arith::TruncIOp::create(rewriter, loc, dstTy, src);
+  return mlir::arith::BitcastOp::create(rewriter, loc, dstTy, src);
+}
+
+inline mlir::arith::CmpIPredicate
+convertCmpKindToCmpIPredicate(cir::CmpOpKind kind, bool isSigned) {
+  using CIR = cir::CmpOpKind;
+  using arithCmpI = mlir::arith::CmpIPredicate;
+  switch (kind) {
+  case CIR::eq:
+    return arithCmpI::eq;
+  case CIR::ne:
+    return arithCmpI::ne;
+  case CIR::lt:
+    return (isSigned ? arithCmpI::slt : arithCmpI::ult);
+  case CIR::le:
+    return (isSigned ? arithCmpI::sle : arithCmpI::ule);
+  case CIR::gt:
+    return (isSigned ? arithCmpI::sgt : arithCmpI::ugt);
+  case CIR::ge:
+    return (isSigned ? arithCmpI::sge : arithCmpI::uge);
+  case CIR::one:
+  case CIR::uno:
+    llvm_unreachable("float-only predicate for integer comparison");
+  }
+  llvm_unreachable("Unknown CmpOpKind");
+}
+
+inline mlir::arith::CmpFPredicate
+convertCmpKindToCmpFPredicate(cir::CmpOpKind kind) {
+  using CIR = cir::CmpOpKind;
+  using arithCmpF = mlir::arith::CmpFPredicate;
+  switch (kind) {
+  case CIR::eq:
+    return arithCmpF::OEQ;
+  case CIR::ne:
+    return arithCmpF::UNE;
+  case CIR::lt:
+    return arithCmpF::OLT;
+  case CIR::le:
+    return arithCmpF::OLE;
+  case CIR::gt:
+    return arithCmpF::OGT;
+  case CIR::ge:
+    return arithCmpF::OGE;
+  case CIR::one:
+    return arithCmpF::ONE;
+  case CIR::uno:
+    return arithCmpF::UNO;
+  }
+  llvm_unreachable("Unknown CmpOpKind");
+}
+
+} // namespace cir
+
+#endif
