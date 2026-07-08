@@ -136,30 +136,79 @@ struct LowerReturnPass : public impl::LowerReturnBase<LowerReturnPass> {
     return cir::AllocaOp::create(b, loc, ptrTy, name, align);
   }
 
-  // Rewrite one nested return: store its value into retval, set returning=true,
-  // erase it, and guard-climb the trailing ops up to `bodyBlock`.
-  void rewriteNestedReturn(cir::ReturnOp ret, mlir::Value retval,
-                           mlir::Value returningAddr, mlir::Type boolTy,
-                           mlir::Block *bodyBlock) {
+  // Detect ClangIR's canonical return idiom for `ret`:
+  //     store X, SLOT ; %v = load SLOT ; cir.return %v
+  // where SLOT is a function-scope alloca (in `bodyBlock`). Returns SLOT if the
+  // pattern matches, else null. When it matches, the return value already lives
+  // in SLOT memory, so the pass can reuse that slot instead of threading a
+  // pass-owned SSA capture value through the guard-climb.
+  mlir::Value returnSlot(cir::ReturnOp ret, mlir::Block *bodyBlock) {
+    if (ret.getNumOperands() != 1)
+      return {};
+    auto ld = ret.getOperand(0).getDefiningOp<cir::LoadOp>();
+    if (!ld || !ld->hasOneUse())
+      return {};
+    if (ld->getNextNode() != ret.getOperation())
+      return {}; // load must immediately precede the return
+    auto st = dyn_cast_or_null<cir::StoreOp>(ld->getPrevNode());
+    if (!st || st.getAddr() != ld.getAddr())
+      return {}; // the store just before must target the same slot
+    auto alloca = ld.getAddr().getDefiningOp<cir::AllocaOp>();
+    if (!alloca || alloca->getBlock() != bodyBlock)
+      return {}; // slot must be a function-scope alloca
+    return ld.getAddr();
+  }
+
+  // Materialize one nested return IN PLACE (no guard-climb yet): ensure its
+  // value is in `retval` MEMORY, set returning=true, erase the return, and
+  // re-terminate the block. Returns the flag-store op to later climb from.
+  //
+  // INVARIANT (the correctness contract of this pass): no SSA value produced
+  // here may cross a region boundary it does not dominate. The return value is
+  // only ever communicated through the `retval` memory slot -- never a captured
+  // SSA value -- so the subsequent guard-climb is free to relocate whole runs
+  // of ops into `cir.if(!returning)` regions without ever splitting a def from
+  // its use.
+  //   * mode A (`slotReuse`): the value is already in `retval` (== the ClangIR
+  //     `__retval` slot) via the pre-existing `store X, slot`; we simply drop
+  //     the now-dead `load slot` and the return.
+  //   * mode B (fallback for non-idiom / hand-written CIR): store the return
+  //     operand DIRECTLY to `retval` at the return site (never capture a load's
+  //     SSA result), keeping the value's def contiguous with the store.
+  mlir::Operation *materializeReturn(cir::ReturnOp ret, mlir::Value retval,
+                                     bool slotReuse, mlir::Value returningAddr) {
     mlir::OpBuilder b(ret);
     auto loc = ret.getLoc();
-    if (retval && ret.getNumOperands() != 0)
+    cir::LoadOp deadLoad;
+    if (slotReuse) {
+      // Value already in `retval` (== slot); the load feeding the return is now
+      // dead once the return is gone.
+      deadLoad = ret.getOperand(0).getDefiningOp<cir::LoadOp>();
+    } else if (retval && ret.getNumOperands() != 0) {
       cir::StoreOp::create(b, loc, ret.getOperand(0), retval);
+    }
     mlir::Value trueVal =
         cir::ConstantOp::create(b, loc, cir::BoolAttr::get(&getContext(), true));
-    cir::StoreOp::create(b, loc, trueVal, returningAddr);
+    mlir::Operation *flagStore =
+        cir::StoreOp::create(b, loc, trueVal, returningAddr);
     mlir::Block *retBlock = ret->getBlock();
-    mlir::Operation *store = ret->getPrevNode();
     ret->erase();
+    if (slotReuse && deadLoad && deadLoad->use_empty())
+      deadLoad->erase();
     // The return was the block terminator; re-terminate the block.
     if (retBlock->empty() ||
         !retBlock->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
       mlir::OpBuilder tb(retBlock, retBlock->end());
       cir::YieldOp::create(tb, loc);
     }
-    // Climb from the returning-store up to the function body block, guarding
-    // the trailing ops at each ancestor level in `cir.if(!returning)`.
-    mlir::Operation *runner = store;
+    return flagStore;
+  }
+
+  // Guard-climb from `anchor` up to the function body block, guarding the
+  // trailing ops at each ancestor level in `cir.if(!returning)`.
+  void climb(mlir::Operation *anchor, mlir::Value returningAddr,
+             mlir::Type boolTy, mlir::Block *bodyBlock) {
+    mlir::Operation *runner = anchor;
     while (runner->getBlock() != bodyBlock) {
       wrapTrailing(runner, returningAddr, boolTy);
       runner = runner->getParentOp();
@@ -239,9 +288,40 @@ struct LowerReturnPass : public impl::LowerReturnBase<LowerReturnPass> {
     bool hasRet = !fnType.hasVoidReturn();
     auto loc = func.getLoc();
 
+    // Mode A eligibility: every return (each nested return plus the tail return,
+    // if any) is ClangIR's canonical `store X, SLOT; load SLOT; return` idiom
+    // targeting the SAME function-scope slot. When so, reuse that memory slot as
+    // `retval` -- no pass-owned SSA capture value is ever threaded through the
+    // guard-climb, which is what makes the single-exit rewrite dominance-safe.
+    mlir::Value slot;
+    bool slotReuse = hasRet;
+    if (slotReuse) {
+      for (auto r : nested) {
+        mlir::Value s = returnSlot(r, bodyBlock);
+        if (!s || (slot && s != slot)) {
+          slotReuse = false;
+          break;
+        }
+        slot = s;
+      }
+    }
+    if (slotReuse && tailRet) {
+      mlir::Value s = returnSlot(tailRet, bodyBlock);
+      if (!s || (slot && s != slot))
+        slotReuse = false;
+      else
+        slot = s;
+    }
+    if (slotReuse && !slot)
+      slotReuse = false; // no slot identified (e.g. void); fall back to mode B.
+
     // Function-scope retval (non-void) + returning flag, at the top of the body.
+    // In mode A `retval` is ClangIR's existing `__retval` slot (reused); in mode
+    // B it is a fresh pass-owned alloca.
     mlir::Value retval;
-    if (hasRet)
+    if (slotReuse)
+      retval = slot;
+    else if (hasRet)
       retval = makeAlloca(bodyBlock, fnType.getReturnType(), "retval", loc);
     mlir::Value returningAddr = makeAlloca(bodyBlock, boolTy, "returning", loc);
     {
@@ -255,7 +335,9 @@ struct LowerReturnPass : public impl::LowerReturnBase<LowerReturnPass> {
     // Phase 1: capture the tail (fall-through) value into retval BEFORE the
     // nested guard-climbs, so the guard-climb wraps this store in if(!returning)
     // (the fall-through value must not overwrite retval once we are returning).
-    if (hasRet && tailRet && tailRet.getNumOperands() != 0) {
+    // In mode A this is unnecessary: the tail already carries its own
+    // `store X, slot` right before its load, which the climb guards for free.
+    if (!slotReuse && hasRet && tailRet && tailRet.getNumOperands() != 0) {
       mlir::OpBuilder b(tailRet);
       cir::StoreOp::create(b, tailRet.getLoc(), tailRet.getOperand(0), retval);
     }
@@ -268,12 +350,17 @@ struct LowerReturnPass : public impl::LowerReturnBase<LowerReturnPass> {
         if (isa<cir::ForOp, cir::WhileOp, cir::DoWhileOp>(a))
           enclosingLoops.insert(a);
 
-    // Phase 2: rewrite each nested return (store retval + set flag + climb).
-    for (auto r : nested) {
-      rewriteNestedReturn(r, retval, returningAddr, boolTy, bodyBlock);
-      if (failed)
-        return;
-    }
+    // Phase 2: rewrite each nested return. Materialize ALL of them in place
+    // first (value -> retval memory, set flag, erase return), THEN guard-climb.
+    // Ordering matters: doing every in-place rewrite before any climb guarantees
+    // that when one return's climb wraps another return's region, that region is
+    // already in its final memory-only shape -- so a whole op-run moves together
+    // and no def is ever separated from its use across a region boundary.
+    llvm::SmallVector<mlir::Operation *> anchors;
+    for (auto r : nested)
+      anchors.push_back(materializeReturn(r, retval, slotReuse, returningAddr));
+    for (mlir::Operation *anchor : anchors)
+      climb(anchor, returningAddr, boolTy, bodyBlock);
 
     // Phase 3: strengthen every enclosing loop so a return breaks them all.
     for (mlir::Operation *loop : enclosingLoops) {
@@ -290,8 +377,16 @@ struct LowerReturnPass : public impl::LowerReturnBase<LowerReturnPass> {
         mlir::OpBuilder b(tailRet);
         mlir::Value v = cir::LoadOp::create(b, tailRet.getLoc(),
                                             fnType.getReturnType(), retval);
+        // In mode A the tail's operand was a `load slot` that becomes dead once
+        // we rebuild the exit reading from `retval` (== slot). Drop it.
+        mlir::Operation *tailDef =
+            tailRet.getNumOperands() ? tailRet.getOperand(0).getDefiningOp()
+                                     : nullptr;
         cir::ReturnOp::create(b, tailRet.getLoc(), mlir::ValueRange{v});
         tailRet.erase();
+        if (slotReuse && tailDef && isa<cir::LoadOp>(tailDef) &&
+            tailDef->use_empty())
+          tailDef->erase();
       }
       // void tail return needs no operand -- leave as-is.
     } else {

@@ -1,0 +1,45 @@
+// Fallback (mode B): hand-written CIR whose return operands are NOT materialized
+// via a `store X, __retval; load __retval` idiom (the value is a direct SSA
+// constant). The pass must still produce single-exit form -- using a pass-owned
+// `retval` slot, storing each operand DIRECTLY to memory at the return site (it
+// must never capture a load's SSA result) -- and the same nested-then-sibling
+// shape must not reintroduce the dominance break.
+//
+// RUN: cir-opt %s --cir-lower-return | FileCheck %s
+// RUN: cir-opt %s --cir-lower-return --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @h(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "e" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %a = cir.load %0 : !cir.ptr<!s32i>, !s32i
+      %b = cir.const #cir.int<1> : !s32i
+      %c = cir.cmp eq %a, %b : !s32i
+      cir.if %c {
+        cir.scope {
+          %d = cir.load %0 : !cir.ptr<!s32i>, !s32i
+          %e = cir.const #cir.int<2> : !s32i
+          %f = cir.cmp eq %d, %e : !s32i
+          cir.if %f {
+            %g = cir.const #cir.int<5> : !s32i
+            cir.return %g : !s32i
+          }
+        }
+        %i = cir.const #cir.int<11> : !s32i
+        cir.return %i : !s32i
+      }
+    }
+    %z = cir.const #cir.int<99> : !s32i
+    cir.return %z : !s32i
+  }
+}
+
+// Mode B: a pass-owned "retval" slot is introduced.
+// CHECK-LABEL: cir.func @h
+// CHECK-DAG: cir.alloca {{.*}}"retval"
+// CHECK-DAG: cir.alloca {{.*}}"returning"
+// CHECK: cir.return
+// SCF: func.func @h
+// SCF: return

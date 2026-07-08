@@ -1,0 +1,57 @@
+// Regression: a NESTED return followed by a SIBLING return at an enclosing
+// level (the ubiquitous softfloat shape). Earlier this split a captured SSA
+// value from its defining `load __retval` across an `if(!returning)` region
+// boundary -> "operand #0 does not dominate this use". The fix reuses ClangIR's
+// existing `__retval` memory slot (mode A) so no pass-owned SSA capture value
+// ever crosses a region boundary; the lowering must verify and reach SCF.
+//
+// RUN: cir-opt %s --cir-lower-return | FileCheck %s
+// RUN: cir-opt %s --cir-lower-return --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+module {
+  cir.func @f(%arg0: !s32i) -> !u64i {
+    %0 = cir.alloca "e" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "__retval" align(8) : !cir.ptr<!u64i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %4 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+      %5 = cir.const #cir.int<1> : !s32i
+      %6 = cir.cmp eq %4, %5 : !s32i
+      cir.if %6 {
+        cir.scope {
+          %9 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+          %10 = cir.const #cir.int<2> : !s32i
+          %11 = cir.cmp eq %9, %10 : !s32i
+          cir.if %11 {
+            %12 = cir.const #cir.int<5> : !u64i
+            cir.store %12, %1 : !u64i, !cir.ptr<!u64i>
+            %13 = cir.load %1 : !cir.ptr<!u64i>, !u64i
+            cir.return %13 : !u64i
+          }
+        }
+        %7 = cir.const #cir.int<11> : !u64i
+        cir.store %7, %1 : !u64i, !cir.ptr<!u64i>
+        %8 = cir.load %1 : !cir.ptr<!u64i>, !u64i
+        cir.return %8 : !u64i
+      }
+    }
+    %2 = cir.const #cir.int<99> : !u64i
+    cir.store %2, %1 : !u64i, !cir.ptr<!u64i>
+    %3 = cir.load %1 : !cir.ptr<!u64i>, !u64i
+    cir.return %3 : !u64i
+  }
+}
+
+// Mode A: no pass-owned "retval" alloca -- ClangIR's "__retval" slot is reused.
+// CHECK-LABEL: cir.func @f
+// CHECK: cir.alloca {{.*}}"returning"
+// CHECK-NOT: cir.alloca {{.*}}"retval"
+// CHECK-COUNT-3: cir.store {{.*}} : !cir.bool
+// A single func-level exit that loads the reused slot.
+// CHECK: cir.load %[[SLOT:.*]] : !cir.ptr<!u64i>, !u64i
+// CHECK-NEXT: cir.return
+
+// SCF: func.func @f
+// SCF: return
