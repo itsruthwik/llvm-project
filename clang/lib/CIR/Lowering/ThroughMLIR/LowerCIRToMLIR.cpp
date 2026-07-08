@@ -1257,28 +1257,21 @@ public:
                             "initializer is not yet implemented");
       } else if (auto zeroAttr = mlir::dyn_cast<cir::ZeroAttr>(init.value())) {
         (void)zeroAttr;
-        if (memrefType.getShape().size()) {
-          auto elementType = memrefType.getElementType();
-          auto rtt =
-              mlir::RankedTensorType::get(memrefType.getShape(), elementType);
-          if (mlir::isa<mlir::IntegerType>(elementType))
-            initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
-          else if (mlir::isa<mlir::FloatType>(elementType)) {
-            auto floatZero = mlir::FloatAttr::get(elementType, 0.0).getValue();
-            initialValue = mlir::DenseFPElementsAttr::get(rtt, floatZero);
-          } else
-            initialValue = mlir::Attribute();
-        } else {
-          auto rtt = mlir::RankedTensorType::get({1}, convertedType);
-          if (mlir::isa<mlir::IntegerType>(convertedType))
-            initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
-          else if (mlir::isa<mlir::FloatType>(convertedType)) {
-            auto floatZero =
-                mlir::FloatAttr::get(convertedType, 0.0).getValue();
-            initialValue = mlir::DenseFPElementsAttr::get(rtt, floatZero);
-          } else
-            initialValue = mlir::Attribute();
-        }
+        // Build the zero splat with getZeroAttr so the fill value carries the
+        // element type's real bit width. A raw `DenseIntElementsAttr::get(rtt,
+        // 0)` deduces a 32-bit APInt and asserts (isValidIntOrFloat) on wider
+        // element types, e.g. a `#cir.zero : !cir.array<!u64i x N>` global.
+        auto elementType =
+            memrefType.getShape().size() ? memrefType.getElementType()
+                                         : convertedType;
+        auto rtt = memrefType.getShape().size()
+                       ? mlir::RankedTensorType::get(memrefType.getShape(),
+                                                     elementType)
+                       : mlir::RankedTensorType::get({1}, elementType);
+        if (mlir::isa<mlir::IntegerType, mlir::FloatType>(elementType))
+          initialValue = rewriter.getZeroAttr(rtt);
+        else
+          initialValue = mlir::Attribute();
       } else if (auto intAttr = mlir::dyn_cast<cir::IntAttr>(init.value())) {
         auto rtt = mlir::RankedTensorType::get({1}, convertedType);
         initialValue = mlir::DenseIntElementsAttr::get(rtt, intAttr.getValue());
