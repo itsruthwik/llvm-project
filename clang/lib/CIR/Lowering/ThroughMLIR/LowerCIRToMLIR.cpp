@@ -37,6 +37,8 @@
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Region.h"
@@ -1507,6 +1509,111 @@ flattenPunnedRecordInit(mlir::Attribute initAttr, cir::ArrayType target,
   return std::nullopt;
 }
 
+// Flatten a homogeneous-leaf-scalar `#cir.const_record` (a struct global
+// initializer) into a flat `DenseElementsAttr` of shape [N]. This is the S4
+// const-record path: derive the single leaf scalar type + total flat element
+// count from the record's field TYPES, then reuse flattenPunnedRecordInit to
+// gather values (it already validates uniform element type + the leaf-count ==
+// N size gate). Returns std::nullopt (a REJECT the caller turns into a loud
+// diagnostic) for a union, a heterogeneous leaf type, a nested aggregate
+// member, or -- the core soundness gate -- any ABI-size mismatch between the
+// record's declared size and the flattened leaf bytes (implicit padding /
+// mis-flattening; never silently zero-padded).
+//
+// Implemented here (not in LoweringHelpers.cpp) to reuse the sibling
+// flattenPunnedRecordInit machinery and keep the DataLayout query local to the
+// one pattern that needs it; the bare-cir.constant-holding-a-record path
+// (a separate crash site) is out of scope for this increment.
+static std::optional<mlir::Attribute>
+lowerConstRecordAttr(cir::ConstRecordAttr rec,
+                     const mlir::TypeConverter *converter,
+                     const mlir::DataLayout &dataLayout) {
+  auto recTy = mlir::dyn_cast<cir::RecordType>(rec.getType());
+  if (!recTy || recTy.isUnion())
+    return std::nullopt;
+
+  auto leafCount = [](mlir::Type t) -> int64_t {
+    int64_t c = 1;
+    while (auto at = mlir::dyn_cast<cir::ArrayType>(t)) {
+      c *= at.getSize();
+      t = at.getElementType();
+    }
+    return c;
+  };
+  auto scalarBase = [](mlir::Type t) -> mlir::Type {
+    while (auto at = mlir::dyn_cast<cir::ArrayType>(t))
+      t = at.getElementType();
+    return t;
+  };
+
+  // Derive the unified leaf scalar type and total flat element count from the
+  // field types. A member that is not (an array of) a single scalar -- e.g. a
+  // nested record or a pointer -- is rejected (struct-cluster territory).
+  mlir::Type leafCir;
+  int64_t N = 0;
+  for (mlir::Type fieldTy : recTy.getMembers()) {
+    mlir::Type base = scalarBase(fieldTy);
+    if (!mlir::isa<cir::IntType, cir::BoolType, cir::FPTypeInterface>(base))
+      return std::nullopt;
+    if (!leafCir)
+      leafCir = base;
+    else if (converter->convertType(base) != converter->convertType(leafCir))
+      return std::nullopt; // heterogeneous leaf types
+    N += leafCount(fieldTy);
+  }
+  if (!leafCir || N == 0)
+    return std::nullopt;
+
+  mlir::Type convElt = converter->convertType(leafCir);
+  if (!convElt)
+    return std::nullopt;
+
+  // Core soundness gate: the flattened leaf byte count must equal the record's
+  // ABI size. A mismatch means implicit alignment padding or a mis-flattened
+  // nested type -- either way the flat tensor would be wrong, so reject rather
+  // than fabricate a padded (silent-wrong) initializer.
+  unsigned leafBits = 0;
+  if (auto it = mlir::dyn_cast<mlir::IntegerType>(convElt))
+    leafBits = it.getWidth();
+  else if (auto ft = mlir::dyn_cast<mlir::FloatType>(convElt))
+    leafBits = ft.getWidth();
+  else
+    return std::nullopt;
+  uint64_t expectedBits = static_cast<uint64_t>(N) * leafBits;
+  uint64_t declaredBits = dataLayout.getTypeSizeInBits(recTy);
+  if (declaredBits != expectedBits)
+    return std::nullopt;
+
+  // Reuse the homogeneous flattener with a synthetic [N x leaf] target; it
+  // re-validates element types and enforces vals.size() == N.
+  auto target = cir::ArrayType::get(leafCir, N);
+  return flattenPunnedRecordInit(rec, target, converter);
+}
+
+// True when any `cir.get_global` of this global feeds a `cir.cast bitcast`
+// (a type-punned reinterpretation). Such a global is owned by the punned-array
+// path (detectPunnedArrayGlobal): if that path accepted it, it already
+// rewrote the global above; if it BAILED (e.g. two consumers pun to
+// conflicting array types), the global MUST remain a loud failure and must NOT
+// be silently flattened by the homogeneous const-record path -- a flat
+// memref<N x leaf> would honor only one consumer's element type and drop the
+// other. So the const-record flatten vetoes whenever a bitcast consumer exists.
+static bool recordGlobalHasBitcastConsumer(cir::GlobalOp global) {
+  auto moduleOp = global->getParentOfType<mlir::ModuleOp>();
+  if (!moduleOp)
+    return false;
+  bool found = false;
+  moduleOp.walk([&](cir::GetGlobalOp gg) {
+    if (gg.getName() != global.getSymName())
+      return;
+    for (auto *user : gg->getUsers())
+      if (auto c = mlir::dyn_cast<cir::CastOp>(user))
+        if (c.getKind() == cir::CastKind::bitcast)
+          found = true;
+  });
+  return found;
+}
+
 class CIRGlobalOpLowering : public mlir::OpConversionPattern<cir::GlobalOp> {
 public:
   using OpConversionPattern<cir::GlobalOp>::OpConversionPattern;
@@ -1558,6 +1665,45 @@ public:
       return mlir::success();
     }
 
+    // Homogeneous-leaf const-record global (S4). A `!cir.record` global whose
+    // initializer is a `#cir.const_record` of a single leaf scalar type
+    // flattens to a flat `memref<N x leaf>` (mirrors the punned-array path, but
+    // driven by the record's own shape rather than a bitcast consumer). This
+    // composes with -- does not double-claim -- detectPunnedArrayGlobal above:
+    // that fires only when every consumer is a bitcast-to-array, which returns
+    // before reaching here. A record that cannot be soundly flattened
+    // (heterogeneous leaves, implicit padding, nested aggregate, union) is a
+    // loud diagnostic, never the terminal llvm_unreachable.
+    if (auto init = op.getInitialValue()) {
+      if (auto recAttr = mlir::dyn_cast<cir::ConstRecordAttr>(*init);
+          recAttr && !recordGlobalHasBitcastConsumer(op)) {
+        mlir::DataLayout dl(moduleOp);
+        auto flat = lowerConstRecordAttr(recAttr, getTypeConverter(), dl);
+        if (!flat)
+          return op.emitError("ThroughMLIR: const-record global @")
+                 << op.getSymName()
+                 << " cannot be flattened to a homogeneous array (non-uniform "
+                    "leaf type, implicit alignment padding, nested aggregate, "
+                    "or union); this belongs to the struct-lowering cluster";
+        auto dense = mlir::cast<mlir::DenseElementsAttr>(*flat);
+        auto tt = mlir::cast<mlir::RankedTensorType>(dense.getType());
+        auto memrefType =
+            mlir::MemRefType::get(tt.getShape(), tt.getElementType());
+        mlir::IntegerAttr recAlignment =
+            op.getAlignment()
+                ? mlir::IntegerAttr::get(b.getI64Type(), op.getAlignment().value())
+                : mlir::IntegerAttr();
+        std::string recVisibility = op.isPrivate() ? "private" : "public";
+        rewriter.replaceOpWithNewOp<mlir::memref::GlobalOp>(
+            op, b.getStringAttr(op.getSymName()),
+            /*sym_visibility=*/b.getStringAttr(recVisibility),
+            /*type=*/memrefType, dense,
+            /*constant=*/op.getConstant(),
+            /*alignment=*/recAlignment);
+        return mlir::success();
+      }
+    }
+
     const auto CIRSymType = op.getSymType();
     auto convertedType = convertTypeForMemory(*getTypeConverter(), CIRSymType);
     if (!convertedType)
@@ -1584,7 +1730,10 @@ public:
         if (init.has_value())
           initialValue = init.value();
         else
-          llvm_unreachable("GlobalOp lowering array with initial value fail");
+          return op.emitError("ThroughMLIR: array global @")
+                 << op.getSymName()
+                 << " has an initializer that cannot be lowered to a dense "
+                    "constant (unsupported element attribute)";
       } else if (mlir::isa<cir::ConstComplexAttr>(init.value())) {
         // D6: upstream removed lowerConstComplexAttr; complex global-init
         // lowering is not yet ported. Fail loudly via a diagnostic (stays loud
@@ -1619,8 +1768,11 @@ public:
         initialValue =
             mlir::DenseIntElementsAttr::get(rtt, (char)boolAttr.getValue());
       } else
-        llvm_unreachable(
-            "GlobalOp lowering with initial value is not fully supported yet");
+        return op.emitError("ThroughMLIR: global @")
+               << op.getSymName() << " has an unsupported initializer kind ("
+               << init.value()
+               << "); const-record/array globals flatten earlier, other kinds "
+                  "(e.g. indexed global views) are not yet implemented";
     }
 
     // Add symbol visibility

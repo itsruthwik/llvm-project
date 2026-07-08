@@ -1,0 +1,14 @@
+// A `#cir.const_record` whose fields have DIFFERENT leaf scalar types (i32 vs
+// double) cannot be flattened to a single homogeneous dense tensor -- the leaf
+// bytes would interleave two element types -- so it is honestly REJECTED (a
+// loud diagnostic, never the terminal llvm_unreachable, never a silent tensor).
+// The general (non-flattening) struct lowering owns this shape.
+//
+// RUN: cir-opt %s --cir-to-mlir -verify-diagnostics
+
+!s32i = !cir.int<s, 32>
+!rec = !cir.struct<"H" {!s32i, !cir.double}>
+module @m {
+  // expected-error @+1 {{const-record global @h cannot be flattened}}
+  cir.global constant external @h = #cir.const_record<{#cir.int<10> : !s32i, #cir.fp<1.0> : !cir.double}> : !rec
+}
