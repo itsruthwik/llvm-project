@@ -22,12 +22,20 @@
 // effect (a value read from the environment into memory) is consumed would be a
 // silent miscompile. Those are honestly rejected with a named diagnostic.
 //
+// EXTERNALITY GATE: the name lists below identify libc I/O only when the callee
+// is an EXTERNAL DECLARATION (a prototype with no body in the module). A
+// user-defined function that merely collides with one of these names (e.g.
+// mpeg2's local `read` helper, or a hand-rolled `printf`) is ordinary code and
+// is left completely untouched -- neither scrubbed nor rejected. This is the
+// general mechanism; the name lists never special-case a specific program.
+//
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Dialect/Passes.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
@@ -81,6 +89,15 @@ void ScrubIOPass::runOnOperation() {
       if (!callee)
         return;
       llvm::StringRef name = *callee;
+
+      // Externality gate: only libc I/O declarations (no body in the module)
+      // are candidates. A user-defined function that shadows one of these
+      // names has a body and is ordinary code -- leave it entirely untouched.
+      auto resolved =
+          mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+              call, call.getCalleeAttr());
+      if (resolved && !resolved.isDeclaration())
+        return;
 
       if (isInputReader(name)) {
         call.emitError("ThroughMLIR: input function '")
