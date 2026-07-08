@@ -137,6 +137,33 @@ def FlattenScopeGoto : Pass<"cir-flatten-scope-goto"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def LowerUnionPunning : Pass<"cir-lower-union-punning"> {
+  let summary = "Scalarize same-bit-width union allocas into single-storage "
+                "load/store + bitcast (softfloat u64<->double type-punning)";
+  let description = [{
+    Decomposes a `cir.alloca` of a `!cir.union` whose members are ALL scalar
+    (integer/float) of the SAME bit width into a single scalar-typed alloca of
+    the union's first member (the shared storage). Every `cir.get_member[k]`
+    access on that union is rewritten to a load/store on the shared storage,
+    inserting a scalar `cir.cast(bitcast)` at each use site when the accessed
+    member type differs from the storage type (the u64<->double reinterpretation
+    at the heart of softfloat's `ullong_to_double`/`double_to_ullong`). Because
+    all members are the same width there is no padding and the bit
+    reinterpretation is exact; `--cir-to-mlir` lowers the scalar bitcast to
+    `arith.bitcast`.
+
+    SOUNDNESS: only same-bit-width scalar-member unions are handled. A union
+    with mixed-width members, a non-scalar member, an escaping whole-union
+    pointer, or a member address that escapes (used by anything other than a
+    direct load/store) is honestly REJECTED with a named diagnostic rather than
+    lowered, never silently miscompiled. Runs as a CIR pre-pass before
+    `--cir-to-mlir` (a union has no memref storage model, so `cir.get_member`
+    on it cannot otherwise be materialized).
+  }];
+  let constructor = "mlir::createLowerUnionPunningPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 def ScrubIO : Pass<"cir-scrub-io"> {
   let summary = "Discard console/file output calls for hardware synthesis";
   let description = [{

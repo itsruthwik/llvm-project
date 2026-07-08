@@ -1,24 +1,23 @@
-// Union type-punning via cir.get_member (write member `ll` as u64, read member
-// `d` as double from the SAME storage -- a bit reinterpretation) is NOT yet
-// supported by the ThroughMLIR memref lowering: a union has no memref storage
-// model, so the member pointer cannot be materialized. It is honestly REJECTED
-// (a failed unresolved materialization -- a hard error, never a silent
-// miscompile), NOT lowered. This is the dfdiv/dfmul `ullong_to_double` wall;
-// sound union support is owned by the struct/record lowering cluster.
+// A MIXED-bit-width union (double [64] vs u8 [8]) cannot be scalarized to a
+// single same-width storage cell -- the bit reinterpretation between differing
+// widths is not representable -- so `--cir-lower-union-punning` honestly
+// REJECTS it with a named diagnostic (a hard error, never a silent
+// miscompile). Sound support for such a case would need a byte-addressed
+// storage model owned by the struct/record lowering cluster.
 //
-// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+// RUN: not cir-opt %s --cir-lower-union-punning 2>&1 | FileCheck %s
 
-!u64i = !cir.int<u, 64>
-!rec = !cir.union<"anon.0" {!cir.double, !u64i}>
+!u8i = !cir.int<u, 8>
+!rec = !cir.union<"anon.0" {!cir.double, !u8i}>
 module @m {
-  cir.func @ullong_to_double(%arg0: !u64i) -> !cir.double {
+  cir.func @punmix(%arg0: !u8i) -> !cir.double {
     %0 = cir.alloca "t" align(8) : !cir.ptr<!rec>
-    %1 = cir.get_member %0[1] {name = "ll"} : !cir.ptr<!rec> -> !cir.ptr<!u64i>
-    cir.store align(8) %arg0, %1 : !u64i, !cir.ptr<!u64i>
+    %1 = cir.get_member %0[1] {name = "b"} : !cir.ptr<!rec> -> !cir.ptr<!u8i>
+    cir.store align(1) %arg0, %1 : !u8i, !cir.ptr<!u8i>
     %2 = cir.get_member %0[0] {name = "d"} : !cir.ptr<!rec> -> !cir.ptr<!cir.double>
     %3 = cir.load align(8) %2 : !cir.ptr<!cir.double>, !cir.double
     cir.return %3 : !cir.double
   }
 }
 
-// CHECK: failed to legalize
+// CHECK: differing bit width

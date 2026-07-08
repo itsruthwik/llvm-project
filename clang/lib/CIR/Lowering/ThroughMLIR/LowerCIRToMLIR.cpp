@@ -2056,6 +2056,27 @@ public:
         rewriter.replaceOp(op, src);
         return mlir::success();
       }
+      // Scalar same-bit-width reinterpretation (e.g. the u64<->double punning
+      // that `--cir-lower-union-punning` leaves behind): a value-level
+      // int<->float bitcast between equal-width scalars lowers directly to
+      // `arith.bitcast`. Bit-exact by construction; the width equality is the
+      // soundness gate.
+      {
+        auto srcScalar = src.getType();
+        auto isScalar = [](mlir::Type t) {
+          return mlir::isa<mlir::IntegerType, mlir::FloatType>(t);
+        };
+        auto scalarWidth = [](mlir::Type t) -> unsigned {
+          if (auto i = mlir::dyn_cast<mlir::IntegerType>(t))
+            return i.getWidth();
+          return mlir::cast<mlir::FloatType>(t).getWidth();
+        };
+        if (isScalar(srcScalar) && isScalar(dstConv) &&
+            scalarWidth(srcScalar) == scalarWidth(dstConv)) {
+          rewriter.replaceOpWithNewOp<mlir::arith::BitcastOp>(op, dstConv, src);
+          return mlir::success();
+        }
+      }
       // Any bitcast whose converted operand and result are DIFFERENT memrefs
       // (a genuine byte-level reinterpretation, e.g. array<i64 x 2> viewed as
       // array<i32 x 4>) is honestly rejected. Such a view changes element-wise

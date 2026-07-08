@@ -1,0 +1,29 @@
+// Same-bit-width union type-punning (softfloat `ullong_to_double`: write member
+// `ll` as u64, read member `d` as double from the SAME storage -- an exact bit
+// reinterpretation). `--cir-lower-union-punning` scalarizes the union alloca to
+// a single scalar cell and rewrites each member access to a load/store on that
+// cell, inserting a scalar `cir.cast(bitcast)` at use sites; `--cir-to-mlir`
+// lowers the scalar bitcast to `arith.bitcast`. Bit-exact by construction.
+//
+// RUN: cir-opt %s --cir-lower-union-punning --cir-to-mlir | FileCheck %s
+
+!u64i = !cir.int<u, 64>
+!rec = !cir.union<"anon.0" {!cir.double, !u64i}>
+module @m {
+  cir.func @ullong_to_double(%arg0: !u64i) -> !cir.double {
+    %0 = cir.alloca "t" align(8) : !cir.ptr<!rec>
+    %1 = cir.get_member %0[1] {name = "ll"} : !cir.ptr<!rec> -> !cir.ptr<!u64i>
+    cir.store align(8) %arg0, %1 : !u64i, !cir.ptr<!u64i>
+    %2 = cir.get_member %0[0] {name = "d"} : !cir.ptr<!rec> -> !cir.ptr<!cir.double>
+    %3 = cir.load align(8) %2 : !cir.ptr<!cir.double>, !cir.double
+    cir.return %3 : !cir.double
+  }
+}
+
+// CHECK-LABEL: func.func @ullong_to_double
+// CHECK-SAME:    (%[[ARG:.*]]: i64) -> f64
+// CHECK:         %[[A:.*]] = memref.alloca() {{.*}} : memref<1xf64>
+// CHECK:         %[[BC:.*]] = arith.bitcast %[[ARG]] : i64 to f64
+// CHECK:         memref.store %[[BC]], %[[A]]
+// CHECK:         %[[LD:.*]] = memref.load %[[A]]
+// CHECK:         return %[[LD]] : f64

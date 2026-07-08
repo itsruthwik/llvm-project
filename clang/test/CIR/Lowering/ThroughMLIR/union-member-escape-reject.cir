@@ -1,0 +1,20 @@
+// The ADDRESS of a union member escaping (used by anything other than a direct
+// load/store -- here passed to a call) cannot be soundly scalarized: the
+// callee may reinterpret or alias the storage in a way this local rewrite
+// cannot see. `--cir-lower-union-punning` honestly REJECTS it.
+//
+// RUN: not cir-opt %s --cir-lower-union-punning 2>&1 | FileCheck %s
+
+!u64i = !cir.int<u, 64>
+!rec = !cir.union<"anon.0" {!cir.double, !u64i}>
+module @m {
+  cir.func private @sink(!cir.ptr<!u64i>)
+  cir.func @escape() {
+    %0 = cir.alloca "t" align(8) : !cir.ptr<!rec>
+    %1 = cir.get_member %0[1] {name = "ll"} : !cir.ptr<!rec> -> !cir.ptr<!u64i>
+    cir.call @sink(%1) : (!cir.ptr<!u64i>) -> ()
+    cir.return
+  }
+}
+
+// CHECK: escapes
