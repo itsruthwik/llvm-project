@@ -15,6 +15,7 @@ add_clang_library(MLIRCIRTransforms
   IdiomRecognizer.cpp
   LowerBreakContinue.cpp
   LowerReturn.cpp
+  FlattenScopeGoto.cpp
   ScrubIO.cpp
 
   DEPENDS

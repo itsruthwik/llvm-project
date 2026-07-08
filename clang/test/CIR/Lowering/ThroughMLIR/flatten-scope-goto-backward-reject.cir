@@ -1,0 +1,32 @@
+// Backward goto (loop via label) is rejected -- only forward exits flatten.
+//
+// RUN: cir-opt %s --cir-flatten-scope-goto -verify-diagnostics
+
+!s32i = !cir.int<s, 32>
+!u32i = !cir.int<u, 32>
+module {
+  cir.func no_inline dso_local @backward(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "n" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "r" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %2 = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %2, %1 : !s32i, !cir.ptr<!s32i>
+    cir.br ^bb1
+  ^bb1:  // pred: ^bb0
+    cir.label "again"
+    %3 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+    %4 = cir.inc nsw %3 : !s32i
+    cir.store align(4) %4, %1 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+      %7 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      %8 = cir.cmp lt %6, %7 : !s32i
+      cir.if %8 {
+      // expected-error @+1 {{unsupported 'goto' (backward goto)}}
+        cir.goto "again"
+      }
+    }
+    %5 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %5 : !s32i
+  }
+}

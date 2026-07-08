@@ -1,0 +1,82 @@
+// Two INDEPENDENT cross-scope forward-exit gotos, each to its own epilogue label
+// living at the top level of a distinct cir.scope region. --cir-flatten-scope-goto
+// allocates one flag per target label and flattens both independently.
+//
+// RUN: cir-opt %s --cir-flatten-scope-goto | FileCheck %s
+// RUN: cir-opt %s --cir-flatten-scope-goto --cir-goto-solver --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+// CHECK-LABEL: cir.func {{.*}}@multi_label
+// CHECK-DAG: cir.alloca "goto_e1"
+// CHECK-DAG: cir.alloca "goto_e2"
+// CHECK-NOT: cir.goto
+
+// SCF-LABEL: func.func @multi_label
+// SCF-NOT: cir.goto
+// SCF: return
+!s32i = !cir.int<s, 32>
+!u32i = !cir.int<u, 32>
+module {
+  cir.func no_inline dso_local @multi_label(%arg0: !s32i, %arg1: !s32i) -> !s32i {
+    %0 = cir.alloca "a" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "b" align(4) init : !cir.ptr<!s32i>
+    %2 = cir.alloca "r" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.store %arg1, %1 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %3, %2 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      cir.scope {
+        %11 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+        %12 = cir.const #cir.int<10> : !s32i
+        %13 = cir.cmp gt %11, %12 : !s32i
+        cir.if %13 {
+          %14 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+          cir.store align(4) %14, %2 : !s32i, !cir.ptr<!s32i>
+          cir.goto "e1"
+        }
+      }
+      %5 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      %6 = cir.const #cir.int<2> : !s32i
+      %7 = cir.mul nsw %5, %6 : !s32i
+      cir.store align(4) %7, %2 : !s32i, !cir.ptr<!s32i>
+      cir.br ^bb1
+    ^bb1:  // pred: ^bb0
+      cir.label "e1"
+      %8 = cir.const #cir.int<1> : !s32i
+      %9 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+      %10 = cir.add nsw %9, %8 : !s32i
+      cir.store align(4) %10, %2 : !s32i, !cir.ptr<!s32i>
+      cir.yield
+    }
+    cir.scope {
+      cir.scope {
+        %13 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+        %14 = cir.const #cir.int<10> : !s32i
+        %15 = cir.cmp gt %13, %14 : !s32i
+        cir.if %15 {
+          %16 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+          %17 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+          %18 = cir.add nsw %17, %16 : !s32i
+          cir.store align(4) %18, %2 : !s32i, !cir.ptr<!s32i>
+          cir.goto "e2"
+        }
+      }
+      %5 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+      %6 = cir.const #cir.int<2> : !s32i
+      %7 = cir.mul nsw %5, %6 : !s32i
+      %8 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+      %9 = cir.add nsw %8, %7 : !s32i
+      cir.store align(4) %9, %2 : !s32i, !cir.ptr<!s32i>
+      cir.br ^bb1
+    ^bb1:  // pred: ^bb0
+      cir.label "e2"
+      %10 = cir.const #cir.int<3> : !s32i
+      %11 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+      %12 = cir.add nsw %11, %10 : !s32i
+      cir.store align(4) %12, %2 : !s32i, !cir.ptr<!s32i>
+      cir.yield
+    }
+    %4 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    cir.return %4 : !s32i
+  }
+}

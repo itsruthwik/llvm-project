@@ -117,6 +117,26 @@ def LowerReturn : Pass<"cir-lower-return"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def FlattenScopeGoto : Pass<"cir-flatten-scope-goto"> {
+  let summary = "Flatten the single-epilogue cross-scope forward-exit goto idiom";
+  let description = [{
+    Rewrites the classic softfloat "roundAndPack" forward-exit `cir.goto` idiom
+    into flag-guarded structured CIR, so `--cir-goto-solver` never emits an
+    illegal cross-region `cir.br`. Handles only a `cir.goto` nested inside
+    `cir.scope`/`cir.if`/loop regions that jumps FORWARD to a label at the top of
+    a block in the function-body region where that label block is the
+    unconditional `cir.br` fall-through successor of the goto's entry block (a
+    single shared epilogue). Each such goto becomes a per-label `!cir.bool` flag
+    plus the same guard-climb + loop condition strengthening as
+    `--cir-lower-return`. Any other goto (backward, into-scope, multi-target
+    ladder, unsupported) is honestly rejected with a named diagnostic; a
+    top-level goto is left for `--cir-goto-solver`. Runs BEFORE
+    `--cir-goto-solver` so the now dead label is swept.
+  }];
+  let constructor = "mlir::createFlattenScopeGotoPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 def ScrubIO : Pass<"cir-scrub-io"> {
   let summary = "Discard console/file output calls for hardware synthesis";
   let description = [{

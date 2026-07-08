@@ -1,0 +1,93 @@
+// Single shared-epilogue cross-scope forward-exit goto idiom (softfloat
+// "roundAndPack" shape): three cir.goto at scope depths 1 and 2 all jump
+// forward to ONE label whose block is the unconditional cir.br fall-through
+// successor of the function-body entry block. --cir-flatten-scope-goto replaces
+// each goto with a shared boolean flag + guard-climb, so no goto survives and
+// the whole thing lowers cleanly to structured SCF.
+//
+// RUN: cir-opt %s --cir-flatten-scope-goto | FileCheck %s
+// RUN: cir-opt %s --cir-flatten-scope-goto --cir-goto-solver --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+// CHECK-LABEL: cir.func {{.*}}@round_pack
+// CHECK: cir.alloca "goto_roundAndPack"
+// CHECK-NOT: cir.goto
+// A guard-climb wraps trailing ops in cir.if(!flag).
+// CHECK: cir.if
+
+// SCF-LABEL: func.func @round_pack
+// SCF-NOT: cir.goto
+// SCF: return
+
+!s32i = !cir.int<s, 32>
+!u32i = !cir.int<u, 32>
+module {
+  cir.func no_inline dso_local @round_pack(%arg0: !u32i, %arg1: !u32i, %arg2: !u32i) -> !u32i {
+    %0 = cir.alloca "aExp" align(4) init : !cir.ptr<!u32i>
+    %1 = cir.alloca "aSig" align(4) init : !cir.ptr<!u32i>
+    %2 = cir.alloca "bSig" align(4) init : !cir.ptr<!u32i>
+    %3 = cir.alloca "zExp" align(4) init : !cir.ptr<!u32i>
+    %4 = cir.alloca "zSig" align(4) init : !cir.ptr<!u32i>
+    cir.store %arg0, %0 : !u32i, !cir.ptr<!u32i>
+    cir.store %arg1, %1 : !u32i, !cir.ptr<!u32i>
+    cir.store %arg2, %2 : !u32i, !cir.ptr<!u32i>
+    %5 = cir.load align(4) %0 : !cir.ptr<!u32i>, !u32i
+    cir.store align(4) %5, %3 : !u32i, !cir.ptr<!u32i>
+    %6 = cir.load align(4) %1 : !cir.ptr<!u32i>, !u32i
+    cir.store align(4) %6, %4 : !u32i, !cir.ptr<!u32i>
+    cir.scope {
+      %18 = cir.load align(4) %0 : !cir.ptr<!u32i>, !u32i
+      %19 = cir.const #cir.int<100> : !u32i
+      %20 = cir.cmp gt %18, %19 : !u32i
+      cir.if %20 {
+        cir.scope {
+          %24 = cir.load align(4) %1 : !cir.ptr<!u32i>, !u32i
+          %25 = cir.const #cir.int<200> : !u32i
+          %26 = cir.cmp gt %24, %25 : !u32i
+          cir.if %26 {
+            %27 = cir.load align(4) %1 : !cir.ptr<!u32i>, !u32i
+            %28 = cir.load align(4) %2 : !cir.ptr<!u32i>, !u32i
+            %29 = cir.add %27, %28 : !u32i
+            cir.store align(4) %29, %4 : !u32i, !cir.ptr<!u32i>
+            %30 = cir.load align(4) %0 : !cir.ptr<!u32i>, !u32i
+            %31 = cir.const #cir.int<1> : !u32i
+            %32 = cir.add %30, %31 : !u32i
+            cir.store align(4) %32, %3 : !u32i, !cir.ptr<!u32i>
+            cir.goto "roundAndPack"
+          }
+        }
+        %21 = cir.load align(4) %1 : !cir.ptr<!u32i>, !u32i
+        %22 = cir.load align(4) %2 : !cir.ptr<!u32i>, !u32i
+        %23 = cir.sub %21, %22 : !u32i
+        cir.store align(4) %23, %4 : !u32i, !cir.ptr<!u32i>
+        cir.goto "roundAndPack"
+      }
+    }
+    cir.scope {
+      %18 = cir.load align(4) %0 : !cir.ptr<!u32i>, !u32i
+      %19 = cir.const #cir.int<0> : !u32i
+      %20 = cir.cmp eq %18, %19 : !u32i
+      cir.if %20 {
+        %21 = cir.load align(4) %2 : !cir.ptr<!u32i>, !u32i
+        cir.store align(4) %21, %4 : !u32i, !cir.ptr<!u32i>
+        cir.goto "roundAndPack"
+      }
+    }
+    %7 = cir.load align(4) %1 : !cir.ptr<!u32i>, !u32i
+    %8 = cir.load align(4) %2 : !cir.ptr<!u32i>, !u32i
+    %9 = cir.or %7, %8 : !u32i
+    cir.store align(4) %9, %4 : !u32i, !cir.ptr<!u32i>
+    %10 = cir.load align(4) %0 : !cir.ptr<!u32i>, !u32i
+    cir.store align(4) %10, %3 : !u32i, !cir.ptr<!u32i>
+    cir.br ^bb1
+  ^bb1:  // pred: ^bb0
+    cir.label "roundAndPack"
+    %11 = cir.load align(4) %3 : !cir.ptr<!u32i>, !u32i
+    %12 = cir.const #cir.int<8> : !s32i
+    %13 = cir.shift(left, %11 : !u32i, %12 : !s32i) -> !u32i
+    %14 = cir.load align(4) %4 : !cir.ptr<!u32i>, !u32i
+    %15 = cir.const #cir.int<7> : !u32i
+    %16 = cir.add %14, %15 : !u32i
+    %17 = cir.xor %13, %16 : !u32i
+    cir.return %17 : !u32i
+  }
+}
