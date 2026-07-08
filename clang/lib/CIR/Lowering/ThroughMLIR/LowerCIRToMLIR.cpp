@@ -1049,8 +1049,41 @@ public:
       auto kind = convertCmpKindToCmpFPredicate(op.getKind());
       rewriter.replaceOpWithNewOp<mlir::arith::CmpFOp>(
           op, kind, adaptor.getLhs(), adaptor.getRhs());
-    } else if (auto ty = mlir::dyn_cast<cir::PointerType>(type)) {
-      llvm_unreachable("pointer comparison not supported yet");
+    } else if (mlir::isa<cir::PointerType>(type)) {
+      auto lhs = adaptor.getLhs();
+      auto rhs = adaptor.getRhs();
+      if (!mlir::isa<mlir::MemRefType>(lhs.getType()) ||
+          !mlir::isa<mlir::MemRefType>(rhs.getType()))
+        return op.emitError(
+            "ThroughMLIR: pointer comparison operands did not lower to memref "
+            "(nested pointer or unsupported pointer representation)");
+      // Lower a pointer comparison to an index comparison on the physical
+      // address:  addr = aligned_base_pointer + element_offset.
+      // extract_aligned_pointer_as_index gives the underlying buffer base;
+      // extract_strided_metadata recovers the reinterpret offset (in elements),
+      // which is dropped by the aligned-pointer op alone. For SAME-ALLOCATION
+      // pointers (the sound, observed HLS idiom — a wrap-around cursor
+      // `if (p >= end) p = start`) the identical base cancels and the compare
+      // reduces to the element offsets, which is exactly correct. Adding the
+      // base back in keeps distinct allocations distinct. CROSS-ALLOCATION
+      // pointer comparisons are not physically meaningful after synthesis
+      // (distinct BRAMs); this op-local pattern cannot do the aliasing analysis
+      // to reject them and must leave that to a downstream check rather than
+      // fabricate a gate here.
+      auto loc = op.getLoc();
+      auto addrOf = [&](mlir::Value p) -> mlir::Value {
+        mlir::Value base =
+            mlir::memref::ExtractAlignedPointerAsIndexOp::create(rewriter, loc,
+                                                                 p);
+        auto meta =
+            mlir::memref::ExtractStridedMetadataOp::create(rewriter, loc, p);
+        return mlir::arith::AddIOp::create(rewriter, loc, base,
+                                           meta.getOffset());
+      };
+      auto kind =
+          convertCmpKindToCmpIPredicate(op.getKind(), /*isSigned=*/false);
+      rewriter.replaceOpWithNewOp<mlir::arith::CmpIOp>(op, kind, addrOf(lhs),
+                                                       addrOf(rhs));
     } else {
       return op.emitError() << "unsupported type for CmpOp: " << type;
     }

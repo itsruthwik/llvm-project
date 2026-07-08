@@ -1,0 +1,22 @@
+// Pointer comparison (blowfish wrap-around cursor idiom `if (p >= end)`) lowers
+// to an index comparison on the physical address: aligned base pointer + the
+// element offset (from extract_strided_metadata). For same-allocation pointers
+// the identical base cancels and the compare reduces to the offsets — correct.
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!u8i = !cir.int<u, 8>
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @k(%p: !cir.ptr<!u8i>, %q: !cir.ptr<!u8i>) -> !s32i {
+    %c = cir.cmp ge %p, %q : !cir.ptr<!u8i>
+    %z = cir.const #cir.int<0> : !s32i
+    %o = cir.const #cir.int<1> : !s32i
+    %r = cir.select if %c then %o else %z : (!cir.bool, !s32i, !s32i) -> !s32i
+    cir.return %r : !s32i
+  }
+}
+// CHECK-LABEL: func.func @k
+// CHECK: memref.extract_aligned_pointer_as_index
+// CHECK: memref.extract_aligned_pointer_as_index
+// CHECK: arith.cmpi uge
