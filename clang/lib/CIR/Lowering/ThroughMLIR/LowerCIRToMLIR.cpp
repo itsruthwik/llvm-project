@@ -420,7 +420,7 @@ static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
 }
 
 static mlir::LogicalResult
-prepareReinterpretMetadata(mlir::MemRefType type,
+prepareReinterpretMetadata(mlir::MemRefType type, mlir::Value source,
                            mlir::ConversionPatternRewriter &rewriter,
                            llvm::SmallVectorImpl<mlir::OpFoldResult> &sizes,
                            llvm::SmallVectorImpl<mlir::OpFoldResult> &strides,
@@ -428,8 +428,35 @@ prepareReinterpretMetadata(mlir::MemRefType type,
   sizes.clear();
   strides.clear();
 
-  for (int64_t dim : type.getShape()) {
-    sizes.push_back(rewriter.getIndexAttr(dim));
+  auto sourceType = llvm::dyn_cast<mlir::MemRefType>(source.getType());
+  int64_t sourceRank = sourceType ? sourceType.getRank() : 0;
+
+  for (auto [dimIdx, dim] : llvm::enumerate(type.getShape())) {
+    if (mlir::ShapedType::isDynamic(dim)) {
+      // A dynamic result dimension must be given a dynamic size *Value*.
+      // Pushing a static kDynamic index attr here (with no matching operand)
+      // builds a malformed memref.reinterpret_cast whose getMixedSizes()
+      // asserts in getMixedValues — which crashes the reinterpret_cast constant
+      // folder as soon as the offset is a constant (e.g. backprop's constant
+      // strides), while kernels with non-constant offsets merely skip the fold.
+      // Materialize the size from the source memref (memref.dim). The result
+      // type stays dynamic, so the folder's constifyIndexValues keeps this
+      // dynamic — no result-type mismatch. These reinterpret_casts are erased
+      // after load/store rewiring, so the exact dim is a well-formedness
+      // carrier, not a semantic size.
+      if (!sourceType || sourceRank == 0) {
+        anchorOp->emitError(
+            "cannot materialize dynamic reinterpret_cast size: source is not a "
+            "ranked memref");
+        return mlir::failure();
+      }
+      int64_t srcDim = std::min<int64_t>(dimIdx, sourceRank - 1);
+      mlir::Value dimVal = mlir::memref::DimOp::create(
+          rewriter, anchorOp->getLoc(), source, srcDim);
+      sizes.push_back(dimVal);
+    } else {
+      sizes.push_back(rewriter.getIndexAttr(dim));
+    }
   }
 
   llvm::SmallVector<int64_t, 4> strideValues;
@@ -1508,8 +1535,9 @@ public:
     case CIR::array_to_ptrdecay: {
       auto newDstType = llvm::cast<mlir::MemRefType>(convertTy(dstType));
       llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
-      if (mlir::failed(prepareReinterpretMetadata(newDstType, rewriter, sizes,
-                                                  strides, op.getOperation())))
+      if (mlir::failed(prepareReinterpretMetadata(newDstType, src, rewriter,
+                                                  sizes, strides,
+                                                  op.getOperation())))
         return mlir::failure();
       rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
           op, newDstType, src, rewriter.getIndexAttr(0), sizes, strides);
@@ -1645,8 +1673,9 @@ class CIRGetElementOpLowering
 
     // Replace the GetElementOp with a memref.reinterpret_cast.
     llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
-    if (mlir::failed(prepareReinterpretMetadata(dstType, rewriter, sizes,
-                                                strides, op.getOperation())))
+    if (mlir::failed(prepareReinterpretMetadata(dstType, adaptor.getBase(),
+                                                rewriter, sizes, strides,
+                                                op.getOperation())))
       return mlir::failure();
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
         op, dstType, adaptor.getBase(),
@@ -1717,9 +1746,22 @@ public:
       stride = mlir::arith::IndexCastOp::create(rewriter, op.getLoc(),
                                                 indexType, stride);
 
+    // Build the sizes/strides metadata from the result memref so it stays
+    // consistent with the result rank. Passing empty ValueRanges here left the
+    // static size/stride arrays empty while the result type carried a rank >= 1,
+    // and the reinterpret_cast constant folder then aborts in getMixedValues
+    // ("expected the rank of dynamic values to match ...") — the exact crash on
+    // a rank>1 ptr_stride (e.g. backprop's 2-D array access). The offset is the
+    // dynamic stride; the sizes and strides come from the result layout.
+    llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
+    if (mlir::failed(prepareReinterpretMetadata(memrefType, base, rewriter,
+                                                sizes, strides,
+                                                op.getOperation())))
+      return mlir::failure();
+
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, memrefType, base, stride, mlir::ValueRange{}, mlir::ValueRange{},
-        llvm::ArrayRef<mlir::NamedAttribute>{});
+        op, memrefType, base, /*offset=*/mlir::OpFoldResult(stride), sizes,
+        strides);
 
     return mlir::success();
   }
