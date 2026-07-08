@@ -164,6 +164,25 @@ def LowerUnionPunning : Pass<"cir-lower-union-punning"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def LowerStructLocals : Pass<"cir-lower-struct-locals"> {
+  let summary = "Scalar-replace (SROA) struct-local allocas whose only uses are "
+                "field accesses into one alloca per field";
+  let description = [{
+    Decomposes a `cir.alloca` of a `!cir.struct` whose every use is a
+    `cir.get_member` field access into one `cir.alloca` per field, replacing
+    each `cir.get_member[k]` with the k-th field alloca's pointer (a pure
+    pointer redirect -- no bitcast, since the field pointee type is unchanged).
+    This removes the struct alloca before `--cir-to-mlir`, which has no memref
+    storage model for `cir.get_member` on a struct (md_grid's scalar struct
+    locals). Array fields are allowed; a whole-struct escape (the alloca used
+    other than by field access) or a nested struct/union field is honestly
+    REJECTED with a named diagnostic (owned by the general struct-lowering
+    cluster), never silently miscompiled.
+  }];
+  let constructor = "mlir::createLowerStructLocalsPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 def ScrubIO : Pass<"cir-scrub-io"> {
   let summary = "Discard console/file output calls for hardware synthesis";
   let description = [{

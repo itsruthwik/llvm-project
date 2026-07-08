@@ -1,0 +1,20 @@
+// A struct local whose pointer ESCAPES (used other than by a field access --
+// here passed whole to a call) is left UNTOUCHED by scalar struct SROA. The
+// pass is additive and never hard-rejects; a genuinely unhandled whole-struct
+// escape fails loudly downstream, not silently here.
+//
+// RUN: cir-opt %s --cir-lower-struct-locals | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!rec = !cir.struct<"P" {!s32i, !s32i}>
+module @m {
+  cir.func private @sink(!cir.ptr<!rec>)
+  cir.func @k() {
+    %0 = cir.alloca "p" align(4) : !cir.ptr<!rec>
+    cir.call @sink(%0) : (!cir.ptr<!rec>) -> ()
+    cir.return
+  }
+}
+
+// CHECK: cir.alloca "p"
+// CHECK: cir.call @sink

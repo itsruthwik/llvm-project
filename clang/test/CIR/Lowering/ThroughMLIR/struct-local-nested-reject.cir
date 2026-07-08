@@ -1,0 +1,21 @@
+// A struct local with a NESTED aggregate field is left UNTOUCHED by scalar
+// struct SROA (nested structs are owned by the general struct-lowering
+// cluster). The pass is additive: it never hard-rejects, so a genuinely
+// unhandled struct still fails loudly downstream at --cir-to-mlir rather than
+// being silently miscompiled here.
+//
+// RUN: cir-opt %s --cir-lower-struct-locals | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!inner = !cir.struct<"I" {!s32i, !s32i}>
+!rec = !cir.struct<"N" {!s32i, !inner}>
+module @m {
+  cir.func @k() {
+    %0 = cir.alloca "n" align(4) : !cir.ptr<!rec>
+    %a = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec> -> !cir.ptr<!s32i>
+    cir.return
+  }
+}
+
+// CHECK: cir.alloca "n"
+// CHECK: cir.get_member

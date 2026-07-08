@@ -1,0 +1,27 @@
+// A scalar struct local whose only uses are field accesses is scalar-replaced
+// (SROA) into one alloca per field by --cir-lower-struct-locals, so --cir-to-mlir
+// (which has no memref storage model for cir.get_member on a struct) lowers it
+// cleanly. Pure pointer redirect -- no bitcast.
+//
+// RUN: cir-opt %s --cir-lower-struct-locals --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!rec = !cir.struct<"P" {!s32i, !s32i}>
+module @m {
+  cir.func @add2(%a: !s32i, %b: !s32i) -> !s32i {
+    %0 = cir.alloca "p" align(4) : !cir.ptr<!rec>
+    %x = cir.get_member %0[0] {name = "x"} : !cir.ptr<!rec> -> !cir.ptr<!s32i>
+    cir.store %a, %x : !s32i, !cir.ptr<!s32i>
+    %y = cir.get_member %0[1] {name = "y"} : !cir.ptr<!rec> -> !cir.ptr<!s32i>
+    cir.store %b, %y : !s32i, !cir.ptr<!s32i>
+    %lx = cir.load %x : !cir.ptr<!s32i>, !s32i
+    %ly = cir.load %y : !cir.ptr<!s32i>, !s32i
+    %s = cir.add %lx, %ly : !s32i
+    cir.return %s : !s32i
+  }
+}
+
+// CHECK-LABEL: func.func @add2
+// CHECK: memref.alloca() {{.*}} : memref<1xi32>
+// CHECK: memref.alloca() {{.*}} : memref<1xi32>
+// CHECK: arith.addi
