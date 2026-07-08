@@ -1,0 +1,16 @@
+// A cir.cast whose SOURCE is a vector type has no ThroughMLIR lowering yet.
+// It must fail with a precise, named diagnostic rather than crashing via
+// llvm_unreachable on otherwise-valid C (vector-typed) input.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!u32i = !cir.int<u, 32>
+module {
+  cir.func @k(%v: !cir.vector<4 x !s32i>) -> !cir.vector<4 x !u32i> {
+    %r = cir.cast bitcast %v : !cir.vector<4 x !s32i> -> !cir.vector<4 x !u32i>
+    cir.return %r : !cir.vector<4 x !u32i>
+  }
+}
+// CHECK: cast with a vector-typed source
+// CHECK-SAME: is not yet implemented

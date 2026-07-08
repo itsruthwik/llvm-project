@@ -357,6 +357,11 @@ void SCFLoop::transferToSCFForOp() {
         if (isBreak && isa<cir::SwitchOp>(anc))
           return mlir::WalkResult::advance(); // owned by an inner switch
       }
+      // Internal invariant: --cir-lower-break-continue runs before cir-to-mlir,
+      // so a loop-targeting break/continue is already removed; and the loop
+      // classifier routes any residual break/continue-bearing loop to the
+      // while-loop path, never here. Reaching this is a classifier/pipeline
+      // contract violation, not valid-C input.
       llvm_unreachable(
           "a for-loop-targeting break/continue must be routed to the "
           "while-loop lowering path");

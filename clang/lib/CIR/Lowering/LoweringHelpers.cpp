@@ -115,6 +115,10 @@ void convertToDenseElementsAttrImpl(
       continue;
     }
 
+    // Internal invariant: reached only for Int/Bool/FP arrays (the caller
+    // lowerConstArrayAttr dispatches on element type first), whose elements are
+    // guaranteed by the CIR verifier to be Int/FP/Bool/sub-array/Zero/Undef —
+    // all handled above. Any other kind is malformed IR, not valid-C input.
     llvm_unreachable("unknown element in ConstArrayAttr");
   }
 }

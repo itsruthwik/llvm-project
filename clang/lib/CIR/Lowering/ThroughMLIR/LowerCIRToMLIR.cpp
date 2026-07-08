@@ -846,8 +846,10 @@ private:
              "mlir::VectorType is not a mlir::ShapedType ??");
       SmallVector<mlir::Attribute> mlirValues;
       for (auto elementAttr : vecAttr.getElts()) {
-        mlirValues.push_back(
-            this->lowerCirAttrToMlirAttr(elementAttr, rewriter));
+        auto loweredElt = this->lowerCirAttrToMlirAttr(elementAttr, rewriter);
+        if (!loweredElt)
+          return {}; // propagate unsupported-kind failure to the caller
+        mlirValues.push_back(loweredElt);
       }
       return mlir::DenseElementsAttr::get(
           mlir::cast<mlir::ShapedType>(mlirType), mlirValues);
@@ -869,7 +871,10 @@ private:
     } else if (auto intAttr = mlir::dyn_cast<cir::IntAttr>(cirAttr)) {
       return rewriter.getIntegerAttr(mlirType, intAttr.getValue());
     } else {
-      llvm_unreachable("NYI: unsupported attribute kind lowering to MLIR");
+      // Unsupported constant attribute kind (e.g. data-member pointers or
+      // indexed global-view initializers). Return null so matchAndRewrite emits
+      // a clean, named diagnostic rather than crashing via llvm_unreachable on
+      // otherwise-valid C input.
       return {};
     }
   }
@@ -878,9 +883,14 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::ConstantOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    auto mlirAttr = this->lowerCirAttrToMlirAttr(op.getValue(), rewriter);
+    if (!mlirAttr)
+      return op.emitError()
+             << "ThroughMLIR: unsupported constant attribute kind '"
+             << op.getValue()
+             << "' has no standard-dialect lowering";
     rewriter.replaceOpWithNewOp<mlir::arith::ConstantOp>(
-        op, getTypeConverter()->convertType(op.getType()),
-        this->lowerCirAttrToMlirAttr(op.getValue(), rewriter));
+        op, getTypeConverter()->convertType(op.getType()), mlirAttr);
     return mlir::LogicalResult::success();
   }
 };
@@ -2098,7 +2108,9 @@ public:
   matchAndRewrite(cir::CastOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     if (isa<cir::VectorType>(op.getSrc().getType()))
-      llvm_unreachable("CastOp lowering for vector type is not supported yet");
+      return op.emitError() << "ThroughMLIR: cast with a vector-typed source ('"
+                            << op.getSrc().getType()
+                            << "') is not yet implemented";
     auto src = adaptor.getSrc();
     auto dstType = op.getType();
     using CIR = cir::CastKind;
@@ -2976,6 +2988,10 @@ mlir::ModuleOp lowerFromCIRToMLIR(mlir::ModuleOp theModule,
   mlir::PassManager pm(mlirCtx);
   pm.addPass(createConvertCIRToMLIRPass());
 
+  // Off the cir-opt `--cir-to-mlir` path: cir-opt runs ConvertCIRToMLIRPass via
+  // its own PassManager and surfaces a pattern failure as a clean nonzero-exit
+  // diagnostic. This wrapper (the retired CIR->LLVM tail's entry) has no
+  // in-flow caller; the fatal errors below are internal driver invariants.
   auto result = !mlir::failed(pm.run(theModule));
   if (!result)
     report_fatal_error(
