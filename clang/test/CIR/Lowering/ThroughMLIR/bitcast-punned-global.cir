@@ -1,0 +1,26 @@
+// A partially-initialized C array `const int t[4] = {8,7}` is emitted by Clang
+// as an anon packed record { array<i32 x 2>, #cir.zero array<i32 x 2> } and
+// recovered through a `cir.cast(bitcast)` to the flat array<i32 x 4>. The global
+// must flatten to memref<4xi32> = dense<[8,7,0,0]> and the bitcast must fold to
+// an identity on the converted memref (no unrealized_conversion_cast survives).
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!rec = !cir.struct<packed {!cir.array<!s32i x 2>, !cir.array<!s32i x 2>}>
+module {
+  cir.global constant external @tbl = #cir.const_record<{#cir.const_array<[#cir.int<8> : !s32i, #cir.int<7> : !s32i]> : !cir.array<!s32i x 2>, #cir.zero : !cir.array<!s32i x 2>}> : !rec {alignment = 16 : i64}
+  cir.func @k(%arg0: !cir.int<s, 64>) -> !s32i {
+    %g = cir.get_global @tbl : !cir.ptr<!rec>
+    %b = cir.cast bitcast %g : !cir.ptr<!rec> -> !cir.ptr<!cir.array<!s32i x 4>>
+    %e = cir.get_element %b[%arg0 : !cir.int<s, 64>] : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %v = cir.load %e : !cir.ptr<!s32i>, !s32i
+    cir.return %v : !s32i
+  }
+}
+// CHECK: memref.global "public" constant @tbl : memref<4xi32> = dense<[8, 7, 0, 0]>
+// CHECK-LABEL: func.func @k
+// CHECK: %[[G:.*]] = memref.get_global @tbl : memref<4xi32>
+// CHECK: memref.load %[[G]]
+// CHECK-NOT: unrealized_conversion_cast
+// CHECK-NOT: cir.cast

@@ -1243,6 +1243,186 @@ public:
   }
 };
 
+// Detect the type-punned array-global idiom that Clang emits for a large,
+// partially-initialized C array (e.g. `static const int tbl[256] = {8,7,...};`
+// where only a prefix is spelled out): the initializer is stored as an
+// anonymous packed record `{ array<T x k>, #cir.zero : array<T x (N-k)> }` and
+// every use recovers the flat `array<T x N>` through a `cir.cast(bitcast)`.
+//
+// Returns the common target array type when the global is record-typed and
+// EVERY `cir.get_global` user feeds only bitcasts to the SAME
+// `!cir.ptr<!cir.array<T x N>>`. Returns a null type otherwise — multiple
+// distinct pun targets, any non-bitcast consumer (e.g. `cir.get_member`, which
+// belongs to the struct-lowering cluster), or a non-record global all fall
+// through to the normal lowering / a loud failure downstream. No RecordType
+// TypeConverter rule is added here; this is the one narrow record exception.
+static cir::ArrayType detectPunnedArrayGlobal(cir::GlobalOp global) {
+  if (!mlir::isa<cir::RecordType>(global.getSymType()))
+    return {};
+  auto moduleOp = global->getParentOfType<mlir::ModuleOp>();
+  if (!moduleOp)
+    return {};
+  cir::ArrayType target;
+  bool sawUse = false;
+  bool valid = true;
+  moduleOp.walk([&](cir::GetGlobalOp gg) {
+    if (gg.getName() != global.getSymName())
+      return;
+    for (auto *user : gg->getUsers()) {
+      auto castOp = mlir::dyn_cast<cir::CastOp>(user);
+      if (!castOp || castOp.getKind() != cir::CastKind::bitcast) {
+        valid = false;
+        return;
+      }
+      auto ptrTy = mlir::dyn_cast<cir::PointerType>(castOp.getType());
+      if (!ptrTy) {
+        valid = false;
+        return;
+      }
+      auto arrTy = mlir::dyn_cast<cir::ArrayType>(ptrTy.getPointee());
+      if (!arrTy) {
+        valid = false;
+        return;
+      }
+      if (target && target != arrTy) {
+        valid = false;
+        return;
+      }
+      target = arrTy;
+      sawUse = true;
+    }
+  });
+  if (!valid || !sawUse)
+    return {};
+  return target;
+}
+
+// Self-contained variant of detectPunnedArrayGlobal that inspects a
+// `cir.get_global`'s OWN uses. Used from CIRGetGlobalOpLowering because by the
+// time a get_global is converted its referenced `cir.global` may already have
+// been rewritten to a `memref.global` (pattern application order), so a symbol
+// lookup for the original `cir::GlobalOp` can miss. Returns the common punned
+// array type when every user is a bitcast to the same `!cir.ptr<array<T x N>>`.
+static cir::ArrayType punnedTargetOfGetGlobal(cir::GetGlobalOp op) {
+  if (!mlir::isa<cir::RecordType>(op.getType().getPointee()))
+    return {};
+  cir::ArrayType target;
+  for (auto *user : op->getUsers()) {
+    auto castOp = mlir::dyn_cast<cir::CastOp>(user);
+    if (!castOp || castOp.getKind() != cir::CastKind::bitcast)
+      return {};
+    auto ptrTy = mlir::dyn_cast<cir::PointerType>(castOp.getType());
+    if (!ptrTy)
+      return {};
+    auto arrTy = mlir::dyn_cast<cir::ArrayType>(ptrTy.getPointee());
+    if (!arrTy)
+      return {};
+    if (target && target != arrTy)
+      return {};
+    target = arrTy;
+  }
+  return target;
+}
+
+// Flatten the `#cir.const_record` initializer of a type-punned array global
+// into a `DenseElementsAttr` of shape [N] (N = `target` array size). The record
+// members must all be `cir.const_array` / `#cir.zero` arrays (or scalar leaves)
+// of the SAME converted element type as `target`; anything else (a nested
+// aggregate, a mismatched element type, or a total leaf count != N, which would
+// imply padding) yields std::nullopt so the caller can fail loudly. The
+// leaf-count == N check with a uniform element type is exactly the bit-exact
+// total-size gate for this homogeneous case.
+static std::optional<mlir::Attribute>
+flattenPunnedRecordInit(mlir::Attribute initAttr, cir::ArrayType target,
+                        const mlir::TypeConverter *converter) {
+  auto rec = mlir::dyn_cast<cir::ConstRecordAttr>(initAttr);
+  if (!rec)
+    return std::nullopt;
+  mlir::Type convElt = converter->convertType(target.getElementType());
+  if (!convElt)
+    return std::nullopt;
+  int64_t N = target.getSize();
+
+  auto leafCount = [](mlir::Type t) -> int64_t {
+    int64_t c = 1;
+    while (auto at = mlir::dyn_cast<cir::ArrayType>(t)) {
+      c *= at.getSize();
+      t = at.getElementType();
+    }
+    return c;
+  };
+  auto scalarBase = [](mlir::Type t) -> mlir::Type {
+    while (auto at = mlir::dyn_cast<cir::ArrayType>(t))
+      t = at.getElementType();
+    return t;
+  };
+
+  if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(convElt)) {
+    llvm::SmallVector<llvm::APInt> vals;
+    vals.reserve(N);
+    for (mlir::Attribute m : rec.getMembers()) {
+      if (auto ca = mlir::dyn_cast<cir::ConstArrayAttr>(m)) {
+        auto de = lowerConstArrayAttr(ca, converter);
+        if (!de)
+          return std::nullopt;
+        auto dea = mlir::dyn_cast<mlir::DenseIntElementsAttr>(*de);
+        if (!dea || dea.getElementType() != convElt)
+          return std::nullopt;
+        for (const llvm::APInt &v : dea.getValues<llvm::APInt>())
+          vals.push_back(v);
+      } else if (auto z = mlir::dyn_cast<cir::ZeroAttr>(m)) {
+        auto zt = mlir::cast<mlir::TypedAttr>(z).getType();
+        if (converter->convertType(scalarBase(zt)) != convElt)
+          return std::nullopt;
+        for (int64_t i = 0, e = leafCount(zt); i < e; ++i)
+          vals.push_back(llvm::APInt(intTy.getWidth(), 0));
+      } else if (auto ia = mlir::dyn_cast<cir::IntAttr>(m)) {
+        if (converter->convertType(
+                mlir::cast<mlir::TypedAttr>(ia).getType()) != convElt)
+          return std::nullopt;
+        vals.push_back(ia.getValue());
+      } else {
+        return std::nullopt;
+      }
+    }
+    if (static_cast<int64_t>(vals.size()) != N)
+      return std::nullopt;
+    return mlir::DenseElementsAttr::get(
+        mlir::RankedTensorType::get({N}, convElt), llvm::ArrayRef(vals));
+  }
+
+  if (auto fltTy = mlir::dyn_cast<mlir::FloatType>(convElt)) {
+    llvm::SmallVector<llvm::APFloat> vals;
+    vals.reserve(N);
+    for (mlir::Attribute m : rec.getMembers()) {
+      if (auto ca = mlir::dyn_cast<cir::ConstArrayAttr>(m)) {
+        auto de = lowerConstArrayAttr(ca, converter);
+        if (!de)
+          return std::nullopt;
+        auto dea = mlir::dyn_cast<mlir::DenseFPElementsAttr>(*de);
+        if (!dea || dea.getElementType() != convElt)
+          return std::nullopt;
+        for (const llvm::APFloat &v : dea.getValues<llvm::APFloat>())
+          vals.push_back(v);
+      } else if (auto z = mlir::dyn_cast<cir::ZeroAttr>(m)) {
+        auto zt = mlir::cast<mlir::TypedAttr>(z).getType();
+        if (converter->convertType(scalarBase(zt)) != convElt)
+          return std::nullopt;
+        for (int64_t i = 0, e = leafCount(zt); i < e; ++i)
+          vals.push_back(llvm::APFloat::getZero(fltTy.getFloatSemantics()));
+      } else {
+        return std::nullopt;
+      }
+    }
+    if (static_cast<int64_t>(vals.size()) != N)
+      return std::nullopt;
+    return mlir::DenseElementsAttr::get(
+        mlir::RankedTensorType::get({N}, convElt), llvm::ArrayRef(vals));
+  }
+
+  return std::nullopt;
+}
+
 class CIRGlobalOpLowering : public mlir::OpConversionPattern<cir::GlobalOp> {
 public:
   using OpConversionPattern<cir::GlobalOp>::OpConversionPattern;
@@ -1254,6 +1434,45 @@ public:
       return mlir::failure();
 
     mlir::OpBuilder b(moduleOp.getContext());
+
+    // Narrow type-punned array-global exception: a record-typed global whose
+    // every get_global user is a bitcast to the same flat array type lowers
+    // directly to that array's memref, folding the record away. See
+    // detectPunnedArrayGlobal. Fails loudly if the initializer cannot be
+    // flattened to a homogeneous array (that would be a struct-cluster shape).
+    if (auto punTarget = detectPunnedArrayGlobal(op)) {
+      auto convElt = getTypeConverter()->convertType(punTarget.getElementType());
+      if (!convElt)
+        return op.emitError("ThroughMLIR: cannot convert element type of "
+                            "type-punned array global @")
+               << op.getSymName();
+      auto memrefType = mlir::MemRefType::get({static_cast<int64_t>(punTarget.getSize())}, convElt);
+      mlir::Attribute initialValue;
+      if (auto init = op.getInitialValue()) {
+        auto flat =
+            flattenPunnedRecordInit(*init, punTarget, getTypeConverter());
+        if (!flat)
+          return op.emitError("ThroughMLIR: type-punned array global @")
+                 << op.getSymName()
+                 << " has an initializer that cannot be flattened to a "
+                    "homogeneous array (non-uniform element type, padding, or "
+                    "nested aggregate); this belongs to the struct-lowering "
+                    "cluster";
+        initialValue = *flat;
+      }
+      mlir::IntegerAttr punAlignment =
+          op.getAlignment()
+              ? mlir::IntegerAttr::get(b.getI64Type(), op.getAlignment().value())
+              : mlir::IntegerAttr();
+      std::string punVisibility = op.isPrivate() ? "private" : "public";
+      rewriter.replaceOpWithNewOp<mlir::memref::GlobalOp>(
+          op, b.getStringAttr(op.getSymName()),
+          /*sym_visibility=*/b.getStringAttr(punVisibility),
+          /*type=*/memrefType, initialValue,
+          /*constant=*/op.getConstant(),
+          /*alignment=*/punAlignment);
+      return mlir::success();
+    }
 
     const auto CIRSymType = op.getSymType();
     auto convertedType = convertTypeForMemory(*getTypeConverter(), CIRSymType);
@@ -1345,6 +1564,37 @@ public:
     // FIXME(cir): Premature DCE to avoid lowering stuff we're not using.
     // CIRGen should mitigate this and not emit the get_global.
     if (op->getUses().empty()) {
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    // Mirror of the type-punned array-global exception in CIRGlobalOpLowering:
+    // when the referenced global is punned, produce a get_global of the flat
+    // array memref directly so the recovering bitcast becomes an identity on
+    // the converted operand (handled by the bitcast case in CIRCastOpLowering).
+    if (auto punTarget = punnedTargetOfGetGlobal(op)) {
+      auto convElt =
+          getTypeConverter()->convertType(punTarget.getElementType());
+      if (!convElt)
+        return op.emitError("ThroughMLIR: cannot convert element type of "
+                            "type-punned array global @")
+               << op.getName();
+      auto memrefType = mlir::MemRefType::get(
+          {static_cast<int64_t>(punTarget.getSize())}, convElt);
+      auto getGlobalOp = mlir::memref::GetGlobalOp::create(
+          rewriter, op.getLoc(), memrefType, op.getName());
+      // Replace the punning bitcast users directly rather than the get_global:
+      // the get_global's result type is `!cir.ptr<record>`, which has NO
+      // conversion (no RecordType rule — struct-cluster territory), so replacing
+      // it would leave the consuming bitcast with an unconvertible operand and
+      // strand it behind unresolved materializations. Each bitcast's *result*
+      // type `!cir.ptr<array<T x N>>` DOES convert to the same memref<N x T>, so
+      // replacing the bitcasts is a clean same-converted-type substitution and
+      // folds the record pun away entirely.
+      for (mlir::Operation *user :
+           llvm::make_early_inc_range(op->getUsers())) {
+        // Guaranteed a bitcast by punnedTargetOfGetGlobal.
+        rewriter.replaceOp(user, getGlobalOp.getResult());
+      }
       rewriter.eraseOp(op);
       return mlir::success();
     }
@@ -1648,6 +1898,37 @@ public:
       else
         rewriter.replaceOpWithNewOp<mlir::arith::FPToUIOp>(op, newDstType, src);
       return mlir::success();
+    }
+    case CIR::bitcast: {
+      auto dstConv = convertTy(dstType);
+      if (!dstConv)
+        return op.emitError("ThroughMLIR: unsupported bitcast — destination "
+                            "type ")
+               << dstType << " has no MLIR conversion";
+      // Same converted type: an identity forward. This is the common case for
+      // the type-punned array global (the get_global already lowered to the
+      // flat array memref, so recovering `ptr<rec>`->`ptr<array<T x N>>`
+      // converts to the same memref).
+      if (src.getType() == dstConv) {
+        rewriter.replaceOp(op, src);
+        return mlir::success();
+      }
+      // Any bitcast whose converted operand and result are DIFFERENT memrefs
+      // (a genuine byte-level reinterpretation, e.g. array<i64 x 2> viewed as
+      // array<i32 x 4>) is honestly rejected. Such a view changes element-wise
+      // indexing, and the downstream load/store base-finding
+      // (findBaseAndIndices) is not plumbed to walk a reinterpret_cast that
+      // sits between two allocations of differing element type; emitting one
+      // would either crash that walk or fabricate a mis-indexed access. No
+      // benchmark in the ptr/array cluster needs this (every observed pun is a
+      // record<->flat-array identity handled above), so it is surfaced rather
+      // than shipped half-working. Extend here only with an end-to-end numeric
+      // check for the new shape.
+      return op.emitError("ThroughMLIR: unsupported bitcast from ")
+             << op.getSrc().getType() << " to " << dstType
+             << " (only same-converted-type forwarding is supported; a "
+                "byte-level memref reinterpretation across differing element "
+                "types is not yet implemented)";
     }
     default:
       break;

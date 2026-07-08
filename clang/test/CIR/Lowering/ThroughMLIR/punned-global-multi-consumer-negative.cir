@@ -1,0 +1,26 @@
+// A record global punned to TWO DISTINCT array types must NOT be silently
+// lowered by picking one target. Detection bails (returns null), the record
+// global falls to the normal path with no RecordType conversion, and the
+// compilation fails loudly instead of miscompiling.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!rec = !cir.struct<packed {!cir.array<!s32i x 2>, !cir.array<!s32i x 2>}>
+module {
+  cir.global constant external @tbl = #cir.const_record<{#cir.const_array<[#cir.int<8> : !s32i, #cir.int<7> : !s32i]> : !cir.array<!s32i x 2>, #cir.zero : !cir.array<!s32i x 2>}> : !rec {alignment = 16 : i64}
+  cir.func @k(%i: !s64i) -> !s32i {
+    %g0 = cir.get_global @tbl : !cir.ptr<!rec>
+    %b0 = cir.cast bitcast %g0 : !cir.ptr<!rec> -> !cir.ptr<!cir.array<!s32i x 4>>
+    %e0 = cir.get_element %b0[%i : !s64i] : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %v0 = cir.load %e0 : !cir.ptr<!s32i>, !s32i
+    %g1 = cir.get_global @tbl : !cir.ptr<!rec>
+    %b1 = cir.cast bitcast %g1 : !cir.ptr<!rec> -> !cir.ptr<!cir.array<!s64i x 2>>
+    %e1 = cir.get_element %b1[%i : !s64i] : !cir.ptr<!cir.array<!s64i x 2>> -> !cir.ptr<!s64i>
+    %v1 = cir.load %e1 : !cir.ptr<!s64i>, !s64i
+    cir.return %v0 : !s32i
+  }
+}
+// CHECK: error
+// CHECK-NOT: memref.global{{.*}}@tbl

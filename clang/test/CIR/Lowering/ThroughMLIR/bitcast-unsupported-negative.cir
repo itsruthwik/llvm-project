@@ -1,0 +1,19 @@
+// A bitcast whose source and destination differ in TOTAL bit size
+// (array<i32 x 4> = 128 bits  ->  array<i32 x 8> = 256 bits) must be rejected
+// with a precise diagnostic rather than fabricating a reinterpret over a
+// different amount of storage.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module {
+  cir.func @k(%p: !cir.ptr<!cir.array<!s32i x 4>>, %i: !s64i) -> !s32i {
+    %b = cir.cast bitcast %p : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!cir.array<!s32i x 8>>
+    %e = cir.get_element %b[%i : !s64i] : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    %v = cir.load %e : !cir.ptr<!s32i>, !s32i
+    cir.return %v : !s32i
+  }
+}
+// CHECK: unsupported bitcast
+// CHECK-NOT: memref.reinterpret_cast

@@ -1,0 +1,20 @@
+// A byte-level array bitcast across differing element types (array<i64 x 2>
+// viewed as array<i32 x 4>, equal total bit size) is honestly rejected: it
+// would change element-wise indexing and the downstream load base-finding is
+// not plumbed for a cross-element-type reinterpret. No cluster kernel needs it
+// (real puns are record<->flat-array identity forwards).
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module {
+  cir.func @k(%p: !cir.ptr<!cir.array<!s64i x 2>>, %i: !s64i) -> !s32i {
+    %b = cir.cast bitcast %p : !cir.ptr<!cir.array<!s64i x 2>> -> !cir.ptr<!cir.array<!s32i x 4>>
+    %e = cir.get_element %b[%i : !s64i] : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %v = cir.load %e : !cir.ptr<!s32i>, !s32i
+    cir.return %v : !s32i
+  }
+}
+// CHECK: unsupported bitcast
+// CHECK: not yet implemented
