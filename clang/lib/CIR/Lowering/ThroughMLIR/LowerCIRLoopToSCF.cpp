@@ -337,14 +337,30 @@ void SCFLoop::transferToSCFForOp() {
   rewriter->inlineBlockBefore(&forOp.getBody().front(), scfForOp.getBody(),
                               scfForOp.getBody()->end(), bbArg);
   scfForOp->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation *op) {
-    // break/continue are routed to the while-loop path by analysis()
-    // (hasBreakContinue => non-canonical), so they must never reach the
-    // canonical scf.for lowering. An inner cir.if IS supported: it lowers to
-    // scf.if and its IV loads are replaced by this same PreOrder walk (the
-    // walk descends into the if's regions). This mirrors the while+if path.
-    if (isa<cir::BreakOp>(op) || isa<cir::ContinueOp>(op))
+    // A break/continue that TARGETS this for-loop is routed to the while-loop
+    // path by analysis() (hasBreakContinue => non-canonical), so it must never
+    // reach the canonical scf.for lowering. A break/continue owned by an INNER
+    // switch/loop nested in the body is legitimate: it targets that construct
+    // and is consumed when that construct is lowered (e.g. an inner cir.switch's
+    // case `break`). We must not assert on those, but we still descend so this
+    // loop's IV loads inside the inner construct get replaced. An inner cir.if
+    // IS supported the same way.
+    if (isa<cir::BreakOp>(op) || isa<cir::ContinueOp>(op)) {
+      bool isBreak = isa<cir::BreakOp>(op);
+      for (mlir::Operation *anc = op->getParentOp(); anc;
+           anc = anc->getParentOp()) {
+        if (anc == scfForOp.getOperation())
+          break; // reached the loop root without a nearer owner
+        if (isa<cir::ForOp, cir::WhileOp, cir::DoWhileOp, mlir::scf::ForOp,
+                mlir::scf::WhileOp>(anc))
+          return mlir::WalkResult::advance(); // owned by an inner loop
+        if (isBreak && isa<cir::SwitchOp>(anc))
+          return mlir::WalkResult::advance(); // owned by an inner switch
+      }
       llvm_unreachable(
-          "break/continue must be routed to the while-loop lowering path");
+          "a for-loop-targeting break/continue must be routed to the "
+          "while-loop lowering path");
+    }
     // Replace the IV usage to scf loop induction variable.
     if (isIVLoad(op, ivAddr)) {
       // Replace CIR IV load with scf.IV
@@ -733,10 +749,191 @@ public:
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Switch lowering: cir.switch -> scf.index_switch
+//===----------------------------------------------------------------------===//
+
+// True if `brk` is a `break` whose nearest enclosing loop/switch is `sw` (i.e.
+// it targets this switch, not an inner loop/switch nested inside a case).
+static bool breakTargetsSwitch(cir::BreakOp brk, cir::SwitchOp sw) {
+  for (mlir::Operation *anc = brk->getParentOp(); anc; anc = anc->getParentOp()) {
+    if (anc == sw.getOperation())
+      return true;
+    if (mlir::isa<ForOp, WhileOp, DoWhileOp, SwitchOp>(anc))
+      return false; // a nearer loop/switch owns this break
+  }
+  return false;
+}
+
+class CIRSwitchOpLowering : public mlir::OpConversionPattern<cir::SwitchOp> {
+public:
+  using OpConversionPattern<cir::SwitchOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::SwitchOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    if (op->getNumResults() != 0)
+      return op.emitError("ThroughMLIR: 'switch' producing values is not "
+                          "supported by the CIR-to-MLIR lowering");
+
+    // Only the "simple form" (all cases directly in the switch body, no labels,
+    // no code before the first case, no goto) can be lowered structurally.
+    llvm::SmallVector<cir::CaseOp> cases;
+    if (!op.isSimpleForm(cases))
+      return op.emitError(
+          "ThroughMLIR: non-simple 'switch' (labels, 'goto', a 'range' case, or "
+          "code before the first case) is not supported by the CIR-to-MLIR "
+          "lowering");
+
+    // `cases` is in program order (collectCases walks the body pre-order).
+    // Validate every case up front so we never emit partial IR.
+    for (auto caseOp : cases) {
+      if (caseOp.getKind() == cir::CaseOpKind::Range)
+        return op.emitError("ThroughMLIR: 'case' ranges (GNU extension) are not "
+                            "supported by the CIR-to-MLIR lowering");
+      mlir::Block &b = caseOp.getCaseRegion().front();
+      // A `return` inside a case would become a func.return nested in an scf
+      // region, which is illegal; reject honestly rather than miscompile.
+      for (mlir::Operation &inner : b)
+        if (mlir::isa<cir::ReturnOp>(inner))
+          return op.emitError("ThroughMLIR: 'return' inside a 'switch' case is "
+                              "not supported by the CIR-to-MLIR lowering");
+      // A break that targets this switch but is nested inside control flow (e.g.
+      // `if (...) break;`) needs the guard-climb transform; not handled yet.
+      // (A break directly in the case block, or one owned by an inner loop, is
+      // fine.)
+      bool nestedBreak = false;
+      caseOp.getCaseRegion().walk([&](cir::BreakOp brk) {
+        if (breakTargetsSwitch(brk, op) && brk->getParentOp() != caseOp)
+          nestedBreak = true;
+      });
+      if (nestedBreak)
+        return op.emitError(
+            "ThroughMLIR: 'break' nested inside control flow within a 'switch' "
+            "case is not yet supported by the CIR-to-MLIR lowering; use a "
+            "top-level 'break' in each case");
+    }
+
+    // Build parallel arrays: for each distinct case value, the index into
+    // `cases` where its fall-through chain starts. `anyof` contributes several
+    // values that all start at the same case. `default` is tracked separately.
+    llvm::SmallVector<int64_t> caseValues;
+    llvm::SmallVector<unsigned> caseStart;
+    int defaultStart = -1;
+    for (unsigned i = 0; i < cases.size(); ++i) {
+      cir::CaseOp c = cases[i];
+      if (c.getKind() == cir::CaseOpKind::Default) {
+        defaultStart = static_cast<int>(i);
+        continue;
+      }
+      for (mlir::Attribute a : c.getValue()) {
+        auto intAttr = mlir::cast<cir::IntAttr>(a);
+        caseValues.push_back(intAttr.getValue().getSExtValue());
+        caseStart.push_back(i);
+      }
+    }
+
+    // Cast the (already type-converted) integer condition to `index`.
+    mlir::Value condInt = adaptor.getCondition();
+    bool isSigned = true;
+    if (auto cirIntTy =
+            mlir::dyn_cast<cir::IntType>(op.getCondition().getType()))
+      isSigned = cirIntTy.isSigned();
+    mlir::Value arg;
+    auto idxTy = rewriter.getIndexType();
+    if (isSigned)
+      arg = mlir::arith::IndexCastOp::create(rewriter, loc, idxTy, condInt);
+    else
+      arg = mlir::arith::IndexCastUIOp::create(rewriter, loc, idxTy, condInt);
+
+    auto switchOp = mlir::scf::IndexSwitchOp::create(
+        rewriter, loc, mlir::TypeRange{}, arg, caseValues, caseValues.size());
+
+    // The fall-through chain of statements executed when control enters a case:
+    // the case's own ops, plus each following case's ops, up to and including
+    // the first case that ends in a top-level `break` (or the last case).
+    auto caseBreaks = [](cir::CaseOp c) {
+      for (mlir::Operation &inner : c.getCaseRegion().front())
+        if (mlir::isa<cir::BreakOp>(inner))
+          return true;
+      return false;
+    };
+    auto chainOf = [&](unsigned start) {
+      llvm::SmallVector<unsigned> chain;
+      for (unsigned i = start; i < cases.size(); ++i) {
+        chain.push_back(i);
+        if (caseBreaks(cases[i]))
+          break;
+      }
+      return chain;
+    };
+
+    // Ordered list of arms: one per distinct case value, then the default.
+    llvm::SmallVector<unsigned> armStart(caseStart.begin(), caseStart.end());
+    bool hasDefault = defaultStart >= 0;
+    if (hasDefault)
+      armStart.push_back(static_cast<unsigned>(defaultStart));
+
+    // Count how many arms include each case in their chain. A case body is
+    // *moved* into its last consuming arm (sound under the one-shot conversion
+    // driver, which cannot always reconcile clones of ops that still need
+    // conversion — e.g. a nested cir.switch); earlier consumers *clone* it.
+    llvm::DenseMap<unsigned, int> total, seen;
+    for (unsigned s : armStart)
+      for (unsigned idx : chainOf(s))
+        total[idx]++;
+
+    auto emitArm = [&](unsigned startIdx, mlir::Region &region) {
+      mlir::Block *block = rewriter.createBlock(&region);
+      rewriter.setInsertionPointToStart(block);
+      auto yieldOp = mlir::scf::YieldOp::create(rewriter, loc);
+      mlir::IRMapping map;
+      for (unsigned idx : chainOf(startIdx)) {
+        bool lastUse = (++seen[idx] == total[idx]);
+        // Snapshot ops first: moving mutates the source block's op list.
+        llvm::SmallVector<mlir::Operation *> body;
+        for (mlir::Operation &inner : cases[idx].getCaseRegion().front()) {
+          if (mlir::isa<cir::YieldOp>(inner))
+            continue;
+          if (mlir::isa<cir::BreakOp>(inner))
+            break; // top-level break terminates the chain
+          body.push_back(&inner);
+        }
+        for (mlir::Operation *inner : body) {
+          if (lastUse)
+            inner->moveBefore(yieldOp);
+          else {
+            rewriter.setInsertionPoint(yieldOp);
+            rewriter.clone(*inner, map);
+          }
+        }
+      }
+    };
+
+    for (unsigned i = 0; i < caseStart.size(); ++i)
+      emitArm(caseStart[i], switchOp.getCaseRegions()[i]);
+
+    if (hasDefault) {
+      emitArm(static_cast<unsigned>(defaultStart), switchOp.getDefaultRegion());
+    } else {
+      // Synthesize an empty default (required by scf.index_switch).
+      mlir::Block *block = rewriter.createBlock(&switchOp.getDefaultRegion());
+      rewriter.setInsertionPointToStart(block);
+      mlir::scf::YieldOp::create(rewriter, loc);
+    }
+
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
 void populateCIRLoopToSCFConversionPatterns(mlir::RewritePatternSet &patterns,
                                             mlir::TypeConverter &converter) {
   patterns.add<CIRForOpLowering, CIRWhileOpLowering, CIRConditionOpLowering,
-               CIRDoOpLowering>(converter, patterns.getContext());
+               CIRDoOpLowering, CIRSwitchOpLowering>(converter,
+                                                     patterns.getContext());
 }
 
 } // namespace cir

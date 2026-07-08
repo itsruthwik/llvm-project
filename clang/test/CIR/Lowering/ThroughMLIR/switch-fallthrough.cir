@@ -1,0 +1,47 @@
+// Textual fall-through: an empty case (no break) must execute the *next*
+// case's body. The fork's clang emits this for the common `case A: case B:`
+// idiom (empty case A falling into case B). The scf.index_switch arm for the
+// falling-through value must contain the spliced next-case body.
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "x" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "r" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %z = cir.const #cir.int<0> : !s32i
+    cir.store %z, %1 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+      cir.switch(%6 : !s32i) {
+        // case 2: (empty) falls through to case 3.
+        cir.case(equal, [#cir.int<2> : !s32i]) {
+          cir.yield
+        }
+        cir.case(equal, [#cir.int<3> : !s32i]) {
+          %8 = cir.const #cir.int<20> : !s32i
+          cir.store %8, %1 : !s32i, !cir.ptr<!s32i>
+          cir.break
+        }
+        cir.yield
+      }
+    }
+    %r = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// CHECK-LABEL: func @f
+// CHECK: scf.index_switch
+// The empty case 2 must still store 20 (spliced from case 3's body).
+// CHECK: case 2 {
+// CHECK-NEXT: memref.store
+// CHECK-NEXT: scf.yield
+// CHECK: case 3 {
+// CHECK-NEXT: memref.store
+// CHECK-NEXT: scf.yield
+// No default in the source: an empty default is synthesized.
+// CHECK: default {
+// CHECK-NEXT: }
+// CHECK-NOT: cir.switch

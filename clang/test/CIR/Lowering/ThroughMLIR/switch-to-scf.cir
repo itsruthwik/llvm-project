@@ -1,0 +1,64 @@
+// Test lowering of cir.switch to scf.index_switch in the ThroughMLIR path.
+// Covers: equal cases, anyof (cloned per value), a synthesized/explicit default,
+// top-level cir.break terminating a case, and the signed index_cast of the
+// condition.
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "x" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "r" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %z = cir.const #cir.int<0> : !s32i
+    cir.store %z, %1 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+      cir.switch(%6 : !s32i) {
+        cir.case(equal, [#cir.int<1> : !s32i]) {
+          %7 = cir.const #cir.int<10> : !s32i
+          cir.store %7, %1 : !s32i, !cir.ptr<!s32i>
+          cir.break
+        }
+        cir.case(anyof, [#cir.int<2> : !s32i, #cir.int<3> : !s32i]) {
+          %8 = cir.const #cir.int<20> : !s32i
+          cir.store %8, %1 : !s32i, !cir.ptr<!s32i>
+          cir.break
+        }
+        cir.case(default, []) {
+          %9 = cir.const #cir.int<99> : !s32i
+          cir.store %9, %1 : !s32i, !cir.ptr<!s32i>
+          cir.yield
+        }
+        cir.yield
+      }
+    }
+    %r = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// CHECK-LABEL: func @f
+// The signed condition is cast to index and switched on.
+// CHECK: %[[IDX:.*]] = arith.index_cast %{{.*}} : i32 to index
+// CHECK: scf.index_switch %[[IDX]]
+// CHECK: case 1 {
+// CHECK:   memref.store
+// CHECK:   scf.yield
+// CHECK: }
+// anyof [2, 3] is cloned into one arm per value, each with the shared body.
+// CHECK: case 2 {
+// CHECK:   memref.store
+// CHECK:   scf.yield
+// CHECK: }
+// CHECK: case 3 {
+// CHECK:   memref.store
+// CHECK:   scf.yield
+// CHECK: }
+// CHECK: default {
+// CHECK:   memref.store
+// CHECK: }
+// No stray cir.switch/cir.case/cir.break survive.
+// CHECK-NOT: cir.switch
+// CHECK-NOT: cir.case
+// CHECK-NOT: cir.break
