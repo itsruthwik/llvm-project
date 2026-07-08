@@ -1,0 +1,25 @@
+// scanf is an INPUT reader whose result is consumed; it cannot be soundly
+// dropped for synthesis and is honestly rejected (named diagnostic).
+//
+// RUN: not cir-opt %s --cir-scrub-io 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s8i = !cir.int<s, 8>
+module @"/tmp/claude-757590189/-mnt-vault2-rsunketa-VTR-HLS-vtrhls/9fa3526c-e1f4-4ea5-bfd4-5f310730acba/scratchpad/sc.c" attributes {cir.lang = #cir.lang<c>, cir.module_asm = [], cir.triple = "x86_64-unknown-linux-gnu", dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vector<4xi64>, !llvm.ptr<271> = dense<32> : vector<4xi64>, !llvm.ptr<272> = dense<64> : vector<4xi64>, i64 = dense<64> : vector<2xi64>, i128 = dense<128> : vector<2xi64>, f80 = dense<128> : vector<2xi64>, !llvm.ptr = dense<64> : vector<4xi64>, i1 = dense<8> : vector<2xi64>, i8 = dense<8> : vector<2xi64>, i16 = dense<16> : vector<2xi64>, i32 = dense<32> : vector<2xi64>, f16 = dense<16> : vector<2xi64>, f64 = dense<64> : vector<2xi64>, f128 = dense<128> : vector<2xi64>, "dlti.endianness" = "little", "dlti.mangling_mode" = "e", "dlti.legal_int_widths" = array<i32: 8, 16, 32, 64>, "dlti.stack_alignment" = 128 : i64>} {
+  cir.global "private" constant cir_private dso_local @".str" = #cir.const_array<"%d" : !cir.array<!s8i x 2>, trailing_zeros> : !cir.array<!s8i x 3> {alignment = 1 : i64}
+  cir.func private @scanf(!cir.ptr<!s8i> {llvm.noundef}, ...) -> !s32i
+  cir.func no_inline no_proto dso_local @f() -> !s32i attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    %1 = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+    %2 = cir.get_global @scanf : !cir.ptr<!cir.func<(!cir.ptr<!s8i>, ...) -> !s32i>>
+    %3 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 3>>
+    %4 = cir.cast array_to_ptrdecay %3 : !cir.ptr<!cir.array<!s8i x 3>> -> !cir.ptr<!s8i>
+    %5 = cir.call @scanf(%4, %1) : (!cir.ptr<!s8i> {llvm.noundef}, !cir.ptr<!s32i> {llvm.noundef}) -> !s32i
+    %6 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+    cir.store %6, %0 : !s32i, !cir.ptr<!s32i>
+    %7 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+    cir.return %7 : !s32i
+  }
+}
+
+// CHECK: error: ThroughMLIR: input function 'scanf' cannot be scrubbed

@@ -1,0 +1,31 @@
+// printf is discarded for hardware synthesis; a consumed result becomes 0.
+// The C reference used by cosim still runs the real printf -- only synthesis
+// is scrubbed. The dead format-string global is later swept by DCE.
+//
+// RUN: cir-opt %s --cir-scrub-io | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s8i = !cir.int<s, 8>
+module @"/tmp/claude-757590189/-mnt-vault2-rsunketa-VTR-HLS-vtrhls/9fa3526c-e1f4-4ea5-bfd4-5f310730acba/scratchpad/pr.c" attributes {cir.lang = #cir.lang<c>, cir.module_asm = [], cir.triple = "x86_64-unknown-linux-gnu", dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vector<4xi64>, !llvm.ptr<271> = dense<32> : vector<4xi64>, !llvm.ptr<272> = dense<64> : vector<4xi64>, i64 = dense<64> : vector<2xi64>, i128 = dense<128> : vector<2xi64>, f80 = dense<128> : vector<2xi64>, !llvm.ptr = dense<64> : vector<4xi64>, i1 = dense<8> : vector<2xi64>, i8 = dense<8> : vector<2xi64>, i16 = dense<16> : vector<2xi64>, i32 = dense<32> : vector<2xi64>, f16 = dense<16> : vector<2xi64>, f64 = dense<64> : vector<2xi64>, f128 = dense<128> : vector<2xi64>, "dlti.endianness" = "little", "dlti.mangling_mode" = "e", "dlti.legal_int_widths" = array<i32: 8, 16, 32, 64>, "dlti.stack_alignment" = 128 : i64>} {
+  cir.global "private" constant cir_private dso_local @".str" = #cir.const_array<"%d" : !cir.array<!s8i x 2>, trailing_zeros> : !cir.array<!s8i x 3> {alignment = 1 : i64}
+  cir.func private @printf(!cir.ptr<!s8i> {llvm.noundef}, ...) -> !s32i
+  cir.func no_inline dso_local @f(%arg0: !s32i {llvm.noundef}) -> !s32i attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "a" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    %2 = cir.alloca "r" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.get_global @printf : !cir.ptr<!cir.func<(!cir.ptr<!s8i>, ...) -> !s32i>>
+    %4 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 3>>
+    %5 = cir.cast array_to_ptrdecay %4 : !cir.ptr<!cir.array<!s8i x 3>> -> !cir.ptr<!s8i>
+    %6 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+    %7 = cir.call @printf(%5, %6) : (!cir.ptr<!s8i> {llvm.noundef}, !s32i {llvm.noundef}) -> !s32i
+    cir.store align(4) %7, %2 : !s32i, !cir.ptr<!s32i>
+    %8 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    cir.store %8, %1 : !s32i, !cir.ptr<!s32i>
+    %9 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %9 : !s32i
+  }
+}
+
+// CHECK-NOT: cir.call @printf
+// CHECK: cir.const #cir.int<0>
