@@ -1,0 +1,45 @@
+// multiple nested returns (two early + one tail): each early return sets the
+// shared `returning` flag and guard-climbs; a single func-level exit remains.
+//
+// RUN: cir-opt %s --cir-lower-return | FileCheck %s
+// RUN: cir-opt %s --cir-lower-return --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i {llvm.noundef}) -> !s32i {
+    %0 = cir.alloca "x" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %4 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      %5 = cir.const #cir.int<0> : !s32i
+      %6 = cir.cmp gt %4, %5 : !s32i
+      cir.if %6 {
+        %7 = cir.const #cir.int<1> : !s32i
+        cir.store %7, %1 : !s32i, !cir.ptr<!s32i>
+        %8 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+        cir.return %8 : !s32i
+      }
+    }
+    cir.scope {
+      %4 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      %5 = cir.const #cir.int<0> : !s32i
+      %6 = cir.cmp lt %4, %5 : !s32i
+      cir.if %6 {
+        %7 = cir.const #cir.int<2> : !s32i
+        cir.store %7, %1 : !s32i, !cir.ptr<!s32i>
+        %8 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+        cir.return %8 : !s32i
+      }
+    }
+    %2 = cir.const #cir.int<3> : !s32i
+    cir.store %2, %1 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %3 : !s32i
+  }
+}
+
+// CHECK: cir.alloca {{.*}}"returning"
+// CHECK-COUNT-2: cir.store {{.*}} : !cir.bool
+// SCF: func.func @f
+// SCF: return

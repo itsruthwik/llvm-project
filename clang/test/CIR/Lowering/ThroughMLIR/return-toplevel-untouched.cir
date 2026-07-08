@@ -1,0 +1,18 @@
+// A function whose only return is already at top level must be left untouched:
+// the pass creates no `returning` flag and no condition strengthening.
+//
+// RUN: cir-opt %s --cir-lower-return | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i {llvm.noundef}) -> !s32i {
+    %0 = cir.const #cir.int<1> : !s32i
+    %1 = cir.add nsw %arg0, %0 : !s32i
+    cir.return %1 : !s32i
+  }
+}
+
+// CHECK: cir.func @f
+// CHECK-NOT: "returning"
+// CHECK-NOT: cir.select if
+// CHECK: cir.return

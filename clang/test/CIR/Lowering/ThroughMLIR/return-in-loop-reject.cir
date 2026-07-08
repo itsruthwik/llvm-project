@@ -1,0 +1,24 @@
+// Tier-1 honest reject: a `cir.return` still nested inside a loop when it
+// reaches the CIR-to-MLIR lowering (e.g. a shape --cir-lower-return declined)
+// is diagnosed up front instead of emitting an illegal func.return inside an
+// scf region. This runs cir-to-mlir WITHOUT --cir-lower-return to exercise the
+// fail-safe validation.
+//
+// RUN: cir-opt %s --cir-to-mlir -verify-diagnostics
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    cir.while {
+      %c1 = cir.const #cir.int<1> : !s32i
+      %b = cir.cast int_to_bool %c1 : !s32i -> !cir.bool
+      cir.condition(%b)
+    } do {
+      // expected-error @+1 {{'return' inside a loop is not supported by the CIR-to-MLIR lowering}}
+      cir.return %arg0 : !s32i
+    }
+    %r = cir.load %0 : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}

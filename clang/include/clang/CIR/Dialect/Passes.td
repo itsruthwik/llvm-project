@@ -96,6 +96,27 @@ def LowerBreakContinue : Pass<"cir-lower-break-continue"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def LowerReturn : Pass<"cir-lower-return"> {
+  let summary = "Rewrite nested early returns into single-exit CIR";
+  let description = [{
+    Rewrites a `cir.func` that contains an early `cir.return` nested inside a
+    loop, `cir.if`, or `cir.scope` into single-exit form so the downstream
+    `--cir-to-mlir` lowering never has to place a `func.return` inside an `scf`
+    region (which is illegal). Uses a function-scope `retval` alloca (for a
+    non-void return) plus a `returning` boolean flag: each nested return stores
+    its value into `retval`, sets `returning=true`, and guard-climbs the
+    trailing ops at every enclosing level inside `cir.if(!returning)`; every
+    enclosing loop's condition is strengthened with
+    `cir.select if returning then false else C` (and a `for` step is guarded so
+    it is skipped on return) so a return breaks out of ALL enclosing loops. The
+    function tail becomes a single `cir.return` loading `retval`. Returns already
+    at function top level are left untouched. Runs after
+    `--cir-lower-break-continue` and before `--cir-to-mlir`.
+  }];
+  let constructor = "mlir::createLowerReturnPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 def ScrubIO : Pass<"cir-scrub-io"> {
   let summary = "Discard console/file output calls for hardware synthesis";
   let description = [{

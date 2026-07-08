@@ -1,0 +1,60 @@
+// return nested in a for loop: condition strengthened AND the for-step is
+// wrapped in cir.if(!returning) so it is skipped once returning.
+//
+// RUN: cir-opt %s --cir-lower-return | FileCheck %s
+// RUN: cir-opt %s --cir-lower-return --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i {llvm.noundef}) -> !s32i {
+    %0 = cir.alloca "x" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %4 = cir.alloca "i" align(4) init : !cir.ptr<!s32i>
+      %5 = cir.const #cir.int<0> : !s32i
+      cir.store align(4) %5, %4 : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %6 = cir.load align(4) %4 : !cir.ptr<!s32i>, !s32i
+        %7 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+        %8 = cir.cmp lt %6, %7 : !s32i
+        cir.condition(%8)
+      } body {
+        cir.scope {
+          cir.scope {
+            %6 = cir.load align(4) %4 : !cir.ptr<!s32i>, !s32i
+            %7 = cir.const #cir.int<5> : !s32i
+            %8 = cir.cmp eq %6, %7 : !s32i
+            cir.if %8 {
+              %9 = cir.load align(4) %4 : !cir.ptr<!s32i>, !s32i
+              cir.store %9, %1 : !s32i, !cir.ptr<!s32i>
+              %10 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+              cir.return %10 : !s32i
+            }
+          }
+        }
+        cir.yield
+      } step {
+        %6 = cir.load align(4) %4 : !cir.ptr<!s32i>, !s32i
+        %7 = cir.inc nsw %6 : !s32i
+        cir.store align(4) %7, %4 : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %2 = cir.const #cir.int<-1> : !s32i
+    cir.store %2, %1 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %3 : !s32i
+  }
+}
+
+// CHECK: cir.alloca {{.*}}"returning"
+// CHECK: cir.for : cond {
+// CHECK: cir.select if
+// The step region is guarded so it is skipped on return.
+// CHECK: } step {
+// CHECK-NEXT: cir.load
+// CHECK-NEXT: cir.not
+// CHECK-NEXT: cir.if
+// SCF: func.func @f
+// SCF: return
