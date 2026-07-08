@@ -484,6 +484,18 @@ static bool loopHasTargetingBreak(mlir::Operation *loopOp) {
   return found;
 }
 
+// A `return` anywhere inside a loop body would be lowered to a `func.return`
+// nested inside an `scf` region, which is illegal (func.return must be parented
+// by func.func). The `--cir-lower-return` pre-pass rewrites such nested returns
+// into single-exit form before this lowering runs; if one still reaches here
+// (e.g. a shape that pass declined), reject it honestly rather than emit
+// malformed IR. This mirrors the return-inside-`switch`-case reject below.
+static bool loopContainsReturn(mlir::Operation *loopOp) {
+  bool found = false;
+  loopOp->walk([&](cir::ReturnOp) { found = true; });
+  return found;
+}
+
 // A `continue` targeting THIS loop. Unlike `break`, `continue` skips an
 // enclosing `switch` (it targets the nearest enclosing loop), so switch is not
 // in the shadowing set.
@@ -520,6 +532,11 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::ForOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    if (loopContainsReturn(op))
+      return op.emitError(
+          "ThroughMLIR: 'return' inside a loop is not supported by the "
+          "CIR-to-MLIR lowering; it must be rewritten into single-exit form by "
+          "the '--cir-lower-return' pre-pass");
     if (loopHasTargetingBreak(op))
       return op.emitError(
           "ThroughMLIR: 'break' inside a loop is not yet supported by the "
@@ -681,6 +698,11 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::WhileOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    if (loopContainsReturn(op))
+      return op.emitError(
+          "ThroughMLIR: 'return' inside a loop is not supported by the "
+          "CIR-to-MLIR lowering; it must be rewritten into single-exit form by "
+          "the '--cir-lower-return' pre-pass");
     if (loopHasTargetingBreak(op))
       return op.emitError(
           "ThroughMLIR: 'break' inside a loop is not yet supported by the "
@@ -706,6 +728,11 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::DoWhileOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    if (loopContainsReturn(op))
+      return op.emitError(
+          "ThroughMLIR: 'return' inside a loop is not supported by the "
+          "CIR-to-MLIR lowering; it must be rewritten into single-exit form by "
+          "the '--cir-lower-return' pre-pass");
     if (loopHasTargetingBreak(op))
       return op.emitError(
           "ThroughMLIR: 'break' inside a loop is not yet supported by the "

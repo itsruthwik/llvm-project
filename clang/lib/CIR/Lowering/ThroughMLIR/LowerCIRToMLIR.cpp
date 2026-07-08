@@ -2224,6 +2224,36 @@ struct SCFPrepHoistLoopInvariant : public mlir::OpRewritePattern<cir::ForOp> {
 void ConvertCIRToMLIRPass::runOnOperation() {
   mlir::ModuleOp theModule = getOperation();
 
+  // Up-front validation: a `cir.return` nested inside a loop would be lowered to
+  // a `func.return` sitting inside an `scf` region, which is illegal
+  // (func.return must be parented by func.func). The `--cir-lower-return`
+  // pre-pass rewrites such nested returns into single-exit form; if one still
+  // reaches here (e.g. a shape that pass declined), reject it up front with a
+  // single clean diagnostic rather than emitting partial/malformed IR mid
+  // conversion. This mirrors the return-inside-`switch`-case reject in the loop
+  // lowering, but runs before applyFullConversion so it never cascades.
+  {
+    bool badReturn = false;
+    theModule.walk([&](cir::ReturnOp ret) {
+      for (mlir::Operation *a = ret->getParentOp(); a; a = a->getParentOp()) {
+        if (mlir::isa<cir::FuncOp>(a))
+          break;
+        if (mlir::isa<cir::ForOp, cir::WhileOp, cir::DoWhileOp>(a)) {
+          ret.emitError(
+              "ThroughMLIR: 'return' inside a loop is not supported by the "
+              "CIR-to-MLIR lowering; it must be rewritten into single-exit form "
+              "by the '--cir-lower-return' pre-pass");
+          badReturn = true;
+          break;
+        }
+      }
+    });
+    if (badReturn) {
+      signalPassFailure();
+      return;
+    }
+  }
+
   // SCF preparation (see patterns above): hoist loop bounds out of the cond
   // region + canonicalize the IV to the cmp LHS, before the conversion, so the
   // canonical-for lowering can build scf.for from out-of-loop operands.
