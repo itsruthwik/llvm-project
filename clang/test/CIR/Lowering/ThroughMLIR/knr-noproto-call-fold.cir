@@ -1,0 +1,25 @@
+// A no-prototype / K&R call `helper()` is emitted by ClangIR as
+// `cir.get_global @helper : !cir.ptr<!cir.func<()>>` feeding an INDIRECT
+// cir.call. The callee is statically known (a defined in-module function), so
+// it must fold to a DIRECT func.call @helper and the func-pointer get_global
+// must disappear. Regression for CHStone sha (sha_transform no-proto call).
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module @m {
+  cir.func no_proto @top() -> !s32i {
+    %0 = cir.get_global @helper : !cir.ptr<!cir.func<()>>
+    cir.call %0() : (!cir.ptr<!cir.func<()>>) -> ()
+    %1 = cir.const #cir.int<0> : !s32i
+    cir.return %1 : !s32i
+  }
+  cir.func no_proto internal private @helper() {
+    cir.return
+  }
+}
+
+// CHECK: func.func @top
+// CHECK: call @helper() : () -> ()
+// CHECK-NOT: cir.get_global
+// CHECK-NOT: unrealized_conversion_cast

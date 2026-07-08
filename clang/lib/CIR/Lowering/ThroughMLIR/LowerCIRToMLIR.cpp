@@ -236,8 +236,16 @@ public:
       return mlir::LogicalResult::success();
 
     } else {
-      // TODO: support lowering of indirect calls via func.call_indirect op
-      return op.emitError() << "lowering of indirect calls not supported yet";
+      // A no-prototype / K&R direct call — ClangIR emits it as
+      // `cir.get_global @foo : !cir.ptr<!cir.func<...>>` feeding an indirect
+      // `cir.call` — is folded to a direct `func.call` by CIRGetGlobalOpLowering
+      // (the func-pointer callee operand is unconvertible, so this pattern is
+      // never even invoked for that shape). Any indirect call that DOES reach
+      // here is a genuine runtime function pointer with no hardware realization.
+      return op.emitError()
+             << "lowering of indirect calls / function pointers is not "
+                "supported (no hardware realization for a runtime function "
+                "pointer)";
     }
   }
 };
@@ -1640,6 +1648,65 @@ public:
     // FIXME(cir): Premature DCE to avoid lowering stuff we're not using.
     // CIRGen should mitigate this and not emit the get_global.
     if (op->getUses().empty()) {
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    // A get_global of a FUNCTION symbol (`!cir.ptr<!cir.func<...>>`) has no
+    // memref storage model. Its only sound use for hardware is as the callee of
+    // an indirect `cir.call` that ClangIR emitted for a no-prototype / K&R
+    // direct call — CIRCallOpLowering folds that to a direct `func.call`,
+    // reading the callee symbol from this (original) op. When every use is such
+    // a call callee, erase this op (the call fold drops the operand); the call
+    // pattern is order-independent because it inspects the original op. Any
+    // OTHER use (stored/compared/passed) is a genuine function pointer with no
+    // hardware realization and is rejected by CIRCallOpLowering / left to fail.
+    if (mlir::isa<cir::FuncType>(op.getType().getPointee())) {
+      // `!cir.ptr<!cir.func<...>>` has no memref storage model, so a consuming
+      // indirect `cir.call` can never have its adaptor built (its callee
+      // operand is unconvertible) — meaning CIRCallOpLowering is never even
+      // invoked for it. Fold the whole no-prototype/K&R shape HERE: resolve the
+      // callee symbol to a DEFINED function and rewrite each indirect call to a
+      // direct `func.call`, then erase this get_global. Any other use is a
+      // genuine runtime function pointer with no hardware realization.
+      bool allUsesAreCallCallee = llvm::all_of(op->getUses(), [&](auto &use) {
+        auto call = mlir::dyn_cast<cir::CallOp>(use.getOwner());
+        return call && call.isIndirect() &&
+               use.getOperandNumber() == 0; // callee operand
+      });
+      if (!allUsesAreCallCallee)
+        return op.emitError()
+               << "get_global of function symbol @" << op.getName()
+               << " that is not a direct call callee (a runtime function "
+                  "pointer) has no hardware realization";
+
+      mlir::Operation *sym =
+          mlir::SymbolTable::lookupNearestSymbolFrom(op, op.getNameAttr());
+      bool isDefined = false;
+      if (auto cf = mlir::dyn_cast_or_null<cir::FuncOp>(sym))
+        isDefined = !cf.isDeclaration();
+      else if (auto ff = mlir::dyn_cast_or_null<mlir::func::FuncOp>(sym))
+        isDefined = !ff.isDeclaration();
+      if (!isDefined)
+        return op.emitError()
+               << "indirect call to function symbol @" << op.getName()
+               << " with no in-module definition is not supported (no "
+                  "hardware realization for a runtime function pointer)";
+
+      for (mlir::Operation *user :
+           llvm::make_early_inc_range(op->getUsers())) {
+        auto call = mlir::cast<cir::CallOp>(user);
+        llvm::SmallVector<mlir::Type> resTypes;
+        if (mlir::failed(getTypeConverter()->convertTypes(
+                call.getResultTypes(), resTypes)))
+          return mlir::failure();
+        llvm::SmallVector<mlir::Value> args;
+        for (mlir::Value arg : call.getArgOperands())
+          args.push_back(rewriter.getRemappedValue(arg));
+        rewriter.setInsertionPoint(call);
+        auto newCall = mlir::func::CallOp::create(
+            rewriter, call.getLoc(), op.getNameAttr(), resTypes, args);
+        rewriter.replaceOp(call, newCall.getResults());
+      }
       rewriter.eraseOp(op);
       return mlir::success();
     }

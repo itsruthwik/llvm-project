@@ -1,0 +1,27 @@
+// A get_global of a FUNCTION symbol whose result ESCAPES (here: stored to a
+// function-pointer variable) is a genuine runtime function pointer. Hardware
+// has no indirect-call construct, so it is honestly REJECTED with a clear
+// diagnostic — never silently mislowered. (The no-proto direct-call shape,
+// where the sole use is a call callee, is folded to a direct func.call; see
+// knr-noproto-call-fold.cir.)
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!fnptr = !cir.ptr<!cir.func<()>>
+module @m {
+  cir.func private @sink(!fnptr)
+  cir.func @top() -> !s32i {
+    // The func-pointer get_global is passed as a call ARGUMENT (not a callee) —
+    // it escapes as a value, so it is a genuine runtime function pointer.
+    %0 = cir.get_global @helper : !cir.ptr<!cir.func<()>>
+    cir.call @sink(%0) : (!fnptr) -> ()
+    %2 = cir.const #cir.int<0> : !s32i
+    cir.return %2 : !s32i
+  }
+  cir.func internal private @helper() {
+    cir.return
+  }
+}
+
+// CHECK: has no hardware realization
