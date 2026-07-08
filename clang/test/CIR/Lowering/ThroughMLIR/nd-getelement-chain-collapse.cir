@@ -1,0 +1,37 @@
+// Chained cir.get_element on a 2-D array (m[i][j]) — the intermediate level is
+// a row pointer !cir.ptr<!cir.array<T x N>>. It must lower to a SINGLE
+// multi-index memref access on the N-D base (chain-collapse), preserving
+// row-major address semantics, rather than stranding the row slice as an empty
+// unrealized_conversion_cast. Regression for aes/viterbi/jpeg/motion/sha/md_grid.
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module @m {
+  cir.func @top(%arg0: !s32i, %arg1: !s32i) -> !s32i {
+    %0 = cir.alloca "m" align(16) : !cir.ptr<!cir.array<!cir.array<!cir.double x 64> x 140>>
+    %1 = cir.const #cir.fp<1.000000e+00> : !cir.double
+    %2 = cir.cast integral %arg1 : !s32i -> !s64i
+    %3 = cir.cast integral %arg0 : !s32i -> !s64i
+    %4 = cir.get_element %0[%3 : !s64i] : !cir.ptr<!cir.array<!cir.array<!cir.double x 64> x 140>> -> !cir.ptr<!cir.array<!cir.double x 64>>
+    %5 = cir.get_element %4[%2 : !s64i] : !cir.ptr<!cir.array<!cir.double x 64>> -> !cir.ptr<!cir.double>
+    cir.store align(8) %1, %5 : !cir.double, !cir.ptr<!cir.double>
+    %6 = cir.cast integral %arg0 : !s32i -> !s64i
+    %7 = cir.cast integral %arg1 : !s32i -> !s64i
+    %8 = cir.get_element %0[%7 : !s64i] : !cir.ptr<!cir.array<!cir.array<!cir.double x 64> x 140>> -> !cir.ptr<!cir.array<!cir.double x 64>>
+    %9 = cir.get_element %8[%6 : !s64i] : !cir.ptr<!cir.array<!cir.double x 64>> -> !cir.ptr<!cir.double>
+    %10 = cir.load align(8) %9 : !cir.ptr<!cir.double>, !cir.double
+    %11 = cir.cast float_to_int %10 : !cir.double -> !s32i
+    cir.return %11 : !s32i
+  }
+}
+
+// The 2-D storage stays a rank-2 memref; no leftover reinterpret_cast / empty cast.
+// CHECK: %[[ALLOCA:.*]] = memref.alloca() {{.*}} : memref<140x64xf64>
+// store m[i][j] : subscripts are [arg0, arg1]
+// CHECK: memref.store {{.*}}, %[[ALLOCA]][%{{.*}}, %{{.*}}] : memref<140x64xf64>
+// load m[j][i]
+// CHECK: memref.load %[[ALLOCA]][%{{.*}}, %{{.*}}] : memref<140x64xf64>
+// CHECK-NOT: reinterpret_cast
+// CHECK-NOT: unrealized_conversion_cast

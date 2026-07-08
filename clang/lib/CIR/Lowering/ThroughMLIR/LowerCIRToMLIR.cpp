@@ -333,14 +333,78 @@ public:
 
 // Find base and indices from memref.reinterpret_cast
 // and put it into eraseList.
+// During dialect conversion a `cir.get_element` on an N-D array is lowered to a
+// `memref.reinterpret_cast` whose result type carries a DYNAMIC offset (see
+// CIRGetElementOpLowering), which differs from the converter's static-offset
+// result type for the get_element and therefore has a
+// builtin.unrealized_conversion_cast inserted on top of it. To keep the
+// reinterpret_cast CHAIN walkable (so the multi-index base/indices can be
+// reconstructed), peel any such single-input memref-to-memref materialization.
+static mlir::Value lookThroughMemrefMaterialization(mlir::Value v) {
+  while (auto ucc = v.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (ucc.getInputs().size() != 1 ||
+        !mlir::isa<mlir::MemRefType>(ucc.getInputs()[0].getType()))
+      break;
+    v = ucc.getInputs()[0];
+  }
+  return v;
+}
+
+// Collapse a chain of `cir.get_element` ops (partial indexing of an N-D array,
+// e.g. `m[i][j]` = get_element(get_element(%base,%i),%j)) into a single
+// multi-index access on the N-D base memref. Walks the ORIGINAL (pre-conversion)
+// cir value chain — each get_element indexes exactly one array dimension — so
+// the reconstructed index list is exactly the row-major subscript sequence and
+// the address semantics (declared dims, row-major stride) are preserved by
+// construction. The per-op `memref.reinterpret_cast` lowerings of the
+// intermediate get_elements become dead and are reconciled away. Returns true
+// and fills base/indices when `addr` is rooted in such a chain over a ranked
+// memref whose rank matches the number of subscripts; false otherwise (callers
+// then fall back to findBaseAndIndices for ptr_stride / single-level cases).
+static bool collapseGetElementChain(mlir::Value addr, mlir::Value &base,
+                                    SmallVector<mlir::Value> &indices,
+                                    mlir::ConversionPatternRewriter &rewriter,
+                                    mlir::Location loc) {
+  SmallVector<mlir::Value> cirIndices;
+  mlir::Value cur = addr;
+  while (auto ge = cur.getDefiningOp<cir::GetElementOp>()) {
+    cirIndices.push_back(ge.getIndex());
+    cur = ge.getBase();
+  }
+  if (cirIndices.empty())
+    return false;
+
+  mlir::Value root = rewriter.getRemappedValue(cur);
+  if (!root)
+    return false;
+  auto mrt = mlir::dyn_cast<mlir::MemRefType>(root.getType());
+  if (!mrt || mrt.getRank() != static_cast<int64_t>(cirIndices.size()))
+    return false;
+
+  std::reverse(cirIndices.begin(), cirIndices.end());
+  auto indexType = rewriter.getIndexType();
+  indices.clear();
+  for (mlir::Value idx : cirIndices) {
+    mlir::Value conv = rewriter.getRemappedValue(idx);
+    if (!conv)
+      return false;
+    if (conv.getType() != indexType)
+      conv = mlir::arith::IndexCastOp::create(rewriter, loc, indexType, conv);
+    indices.push_back(conv);
+  }
+  base = root;
+  return true;
+}
+
 static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
                                SmallVector<mlir::Value> &indices,
                                SmallVector<mlir::Operation *> &eraseList,
                                mlir::ConversionPatternRewriter &rewriter) {
+  addr = lookThroughMemrefMaterialization(addr);
   while (mlir::Operation *addrOp =
              addr.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
     indices.push_back(addrOp->getOperand(1));
-    addr = addrOp->getOperand(0);
+    addr = lookThroughMemrefMaterialization(addrOp->getOperand(0));
     eraseList.push_back(addrOp);
   }
   if (auto castOp = addr.getDefiningOp<mlir::memref::CastOp>()) {
@@ -488,12 +552,18 @@ public:
     SmallVector<mlir::Value> indices;
     SmallVector<mlir::Operation *> eraseList;
     mlir::memref::LoadOp newLoad;
-    bool eraseIntermediateOp = findBaseAndIndices(adaptor.getAddr(), base,
-                                                  indices, eraseList, rewriter);
-    newLoad =
-        mlir::memref::LoadOp::create(rewriter, op.getLoc(), base, indices);
-    if (eraseIntermediateOp)
-      eraseIfSafe(op.getAddr(), base, eraseList, rewriter);
+    if (collapseGetElementChain(op.getAddr(), base, indices, rewriter,
+                                op.getLoc())) {
+      newLoad =
+          mlir::memref::LoadOp::create(rewriter, op.getLoc(), base, indices);
+    } else {
+      bool eraseIntermediateOp = findBaseAndIndices(
+          adaptor.getAddr(), base, indices, eraseList, rewriter);
+      newLoad =
+          mlir::memref::LoadOp::create(rewriter, op.getLoc(), base, indices);
+      if (eraseIntermediateOp)
+        eraseIfSafe(op.getAddr(), base, eraseList, rewriter);
+    }
 
     // Convert adapted result to its original type if needed.
     mlir::Value result = emitFromMemory(rewriter, op, newLoad.getResult());
@@ -515,12 +585,18 @@ public:
 
     // Convert adapted value to its memory type if needed.
     mlir::Value value = emitToMemory(rewriter, op, adaptor.getValue());
-    bool eraseIntermediateOp = findBaseAndIndices(adaptor.getAddr(), base,
-                                                  indices, eraseList, rewriter);
-    rewriter.replaceOpWithNewOp<mlir::memref::StoreOp>(op, value, base,
-                                                       indices);
-    if (eraseIntermediateOp)
-      eraseIfSafe(op.getAddr(), base, eraseList, rewriter);
+    if (collapseGetElementChain(op.getAddr(), base, indices, rewriter,
+                                op.getLoc())) {
+      rewriter.replaceOpWithNewOp<mlir::memref::StoreOp>(op, value, base,
+                                                         indices);
+    } else {
+      bool eraseIntermediateOp = findBaseAndIndices(
+          adaptor.getAddr(), base, indices, eraseList, rewriter);
+      rewriter.replaceOpWithNewOp<mlir::memref::StoreOp>(op, value, base,
+                                                         indices);
+      if (eraseIntermediateOp)
+        eraseIfSafe(op.getAddr(), base, eraseList, rewriter);
+    }
 
     return mlir::LogicalResult::success();
   }
@@ -1978,14 +2054,30 @@ class CIRGetElementOpLowering
     auto dstType =
         cast<mlir::MemRefType>(getTypeConverter()->convertType(op.getType()));
 
+    // For an N-D array, the multi-index access is reconstructed at the
+    // load/store site by collapseGetElementChain, which walks the ORIGINAL
+    // cir.get_element chain and emits a single memref.load/store on the N-D
+    // base (exact row-major semantics, proven by the transpose-read numeric
+    // guard). The reinterpret_cast this pattern emits for an intermediate row
+    // slice then has no live consumer and is reconciled away — so a
+    // rank-reducing view is not materialized here for the common case. A
+    // get_element whose result genuinely ESCAPES as a value (stored into a
+    // pointer variable, passed to a call) with a dynamic index cannot be a
+    // valid identity-offset reinterpret_cast and is left to fail as an honest
+    // hard error rather than a silent mis-indexed access (e.g. CHStone sha's
+    // `char *p = &buf[i]` — a pointer-aliasing gap owned elsewhere).
+    //
+    // Peel any type-mismatch materialization off the base so a chained
+    // get_element sees its parent reinterpret_cast directly.
+    mlir::Value base = lookThroughMemrefMaterialization(adaptor.getBase());
+
     // Replace the GetElementOp with a memref.reinterpret_cast.
     llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
-    if (mlir::failed(prepareReinterpretMetadata(dstType, adaptor.getBase(),
-                                                rewriter, sizes, strides,
-                                                op.getOperation())))
+    if (mlir::failed(prepareReinterpretMetadata(dstType, base, rewriter, sizes,
+                                                strides, op.getOperation())))
       return mlir::failure();
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, dstType, adaptor.getBase(),
+        op, dstType, base,
         /*offset=*/index,
         /*sizes=*/sizes,
         /*strides=*/strides);
