@@ -82,6 +82,32 @@ def GotoSolver : Pass<"cir-goto-solver"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def LowerBreakContinue : Pass<"cir-lower-break-continue"> {
+  let summary = "Rewrite loop-targeting break/continue into break-free CIR";
+  let description = [{
+    Rewrites each `cir.for`/`cir.while`/`cir.do` that contains a loop-targeting
+    `cir.break`/`cir.continue` into structured, break-free CIR using per-loop
+    boolean flag allocas, `cir.if` guard-climbing, `cir.select` condition
+    strengthening, and (for `break` in a `for` loop) a guarded step region so
+    the step is skipped on break but still executes on continue. Runs before
+    `--cir-to-mlir` so the structured loop lowering never sees break/continue.
+  }];
+  let constructor = "mlir::createLowerBreakContinuePass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
+def ScrubIO : Pass<"cir-scrub-io"> {
+  let summary = "Discard console/file output calls for hardware synthesis";
+  let description = [{
+    Erases no-op output calls (printf/puts/putchar/fprintf/fputs/fputc),
+    replacing any consumed i32 result with a constant 0, matching commercial
+    HLS semantics. Input (read) functions whose result is consumed are honestly
+    rejected instead of being silently dropped.
+  }];
+  let constructor = "mlir::createScrubIOPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 def CXXABILowering : Pass<"cir-cxxabi-lowering", "mlir::ModuleOp"> {
   let summary = "Lower CIR according to C++ ABI requirements";
   let description = [{

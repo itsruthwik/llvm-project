@@ -1,0 +1,129 @@
+// same-loop break+continue (two independent flags) and a nested loop whose
+// inner for has no targeting break (left untouched). Both lower cleanly.
+//
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue | FileCheck %s
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+module @"/tmp/claude-757590189/-mnt-vault2-rsunketa-VTR-HLS-vtrhls/9fa3526c-e1f4-4ea5-bfd4-5f310730acba/scratchpad/mix.c" attributes {cir.lang = #cir.lang<c>, cir.module_asm = [], cir.triple = "x86_64-unknown-linux-gnu", dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vector<4xi64>, !llvm.ptr<271> = dense<32> : vector<4xi64>, !llvm.ptr<272> = dense<64> : vector<4xi64>, i64 = dense<64> : vector<2xi64>, i128 = dense<128> : vector<2xi64>, f80 = dense<128> : vector<2xi64>, !llvm.ptr = dense<64> : vector<4xi64>, i1 = dense<8> : vector<2xi64>, i8 = dense<8> : vector<2xi64>, i16 = dense<16> : vector<2xi64>, i32 = dense<32> : vector<2xi64>, f16 = dense<16> : vector<2xi64>, f64 = dense<64> : vector<2xi64>, f128 = dense<128> : vector<2xi64>, "dlti.endianness" = "little", "dlti.mangling_mode" = "e", "dlti.legal_int_widths" = array<i32: 8, 16, 32, 64>, "dlti.stack_alignment" = 128 : i64>} {
+  cir.func no_inline dso_local @g(%arg0: !s32i {llvm.noundef}) -> !s32i attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "n" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    %2 = cir.alloca "s" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %3, %2 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.alloca "i" align(4) init : !cir.ptr<!s32i>
+      %7 = cir.const #cir.int<0> : !s32i
+      cir.store align(4) %7, %6 : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+        %10 = cir.cmp lt %8, %9 : !s32i
+        cir.condition(%10)
+      } body {
+        cir.scope {
+          cir.scope {
+            %11 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+            %12 = cir.const #cir.int<2> : !s32i
+            %13 = cir.cmp eq %11, %12 : !s32i
+            cir.if %13 {
+              cir.continue
+            }
+          }
+          cir.scope {
+            %11 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+            %12 = cir.const #cir.int<50> : !s32i
+            %13 = cir.cmp gt %11, %12 : !s32i
+            cir.if %13 {
+              cir.break
+            }
+          }
+          %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+          %9 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+          %10 = cir.add nsw %9, %8 : !s32i
+          cir.store align(4) %10, %2 : !s32i, !cir.ptr<!s32i>
+        }
+        cir.yield
+      } step {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.inc nsw %8 : !s32i
+        cir.store align(4) %9, %6 : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %4 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    cir.store %4, %1 : !s32i, !cir.ptr<!s32i>
+    %5 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %5 : !s32i
+  }
+  cir.func no_inline dso_local @nested(%arg0: !s32i {llvm.noundef}) -> !s32i attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "n" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    %2 = cir.alloca "s" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %3, %2 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.alloca "i" align(4) init : !cir.ptr<!s32i>
+      %7 = cir.const #cir.int<0> : !s32i
+      cir.store align(4) %7, %6 : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+        %10 = cir.cmp lt %8, %9 : !s32i
+        cir.condition(%10)
+      } body {
+        cir.scope {
+          cir.scope {
+            %8 = cir.alloca "j" align(4) init : !cir.ptr<!s32i>
+            %9 = cir.const #cir.int<0> : !s32i
+            cir.store align(4) %9, %8 : !s32i, !cir.ptr<!s32i>
+            cir.for : cond {
+              %10 = cir.load align(4) %8 : !cir.ptr<!s32i>, !s32i
+              %11 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+              %12 = cir.cmp lt %10, %11 : !s32i
+              cir.condition(%12)
+            } body {
+              cir.scope {
+                %10 = cir.load align(4) %8 : !cir.ptr<!s32i>, !s32i
+                %11 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+                %12 = cir.add nsw %11, %10 : !s32i
+                cir.store align(4) %12, %2 : !s32i, !cir.ptr<!s32i>
+              }
+              cir.yield
+            } step {
+              %10 = cir.load align(4) %8 : !cir.ptr<!s32i>, !s32i
+              %11 = cir.inc nsw %10 : !s32i
+              cir.store align(4) %11, %8 : !s32i, !cir.ptr<!s32i>
+              cir.yield
+            }
+          }
+          cir.scope {
+            %8 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+            %9 = cir.const #cir.int<99> : !s32i
+            %10 = cir.cmp gt %8, %9 : !s32i
+            cir.if %10 {
+              cir.break
+            }
+          }
+        }
+        cir.yield
+      } step {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.inc nsw %8 : !s32i
+        cir.store align(4) %9, %6 : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %4 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    cir.store %4, %1 : !s32i, !cir.ptr<!s32i>
+    %5 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return %5 : !s32i
+  }
+}
+
+// CHECK-DAG: cir.alloca {{.*}}"brk"
+// CHECK-DAG: cir.alloca {{.*}}"cont"
+// SCF: scf.while

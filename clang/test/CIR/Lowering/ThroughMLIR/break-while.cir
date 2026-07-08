@@ -1,0 +1,49 @@
+// break-in-while: the while condition is strengthened with cir.select; there
+// is no step region. Lowers cleanly to scf.while.
+//
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue | FileCheck %s
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "n" align(4) init : !cir.ptr<!s32i>
+    %2 = cir.alloca "s" align(4) init : !cir.ptr<!s32i>
+    %5 = cir.alloca "i" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    %3 = cir.const #cir.int<0> : !s32i
+    cir.store %3, %2 : !s32i, !cir.ptr<!s32i>
+    cir.store %3, %5 : !s32i, !cir.ptr<!s32i>
+    cir.while {
+      %8 = cir.load %5 : !cir.ptr<!s32i>, !s32i
+      %9 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+      %10 = cir.cmp lt %8, %9 : !s32i
+      cir.condition(%10)
+    } do {
+      %14 = cir.load %5 : !cir.ptr<!s32i>, !s32i
+      %15 = cir.load %2 : !cir.ptr<!s32i>, !s32i
+      %16 = cir.add nsw %15, %14 : !s32i
+      cir.store %16, %2 : !s32i, !cir.ptr<!s32i>
+      %12 = cir.const #cir.int<100> : !s32i
+      %13 = cir.cmp gt %16, %12 : !s32i
+      cir.if %13 {
+        cir.break
+      }
+      %17 = cir.inc nsw %14 : !s32i
+      cir.store %17, %5 : !s32i, !cir.ptr<!s32i>
+      cir.yield
+    }
+    %4 = cir.load %2 : !cir.ptr<!s32i>, !s32i
+    cir.return %4 : !s32i
+  }
+}
+
+// CHECK: cir.alloca {{.*}}"brk"
+// CHECK: cir.while {
+// CHECK: cir.select if
+// CHECK: cir.condition
+// After the break's if, the rest of the body is guarded by if(!brk).
+// CHECK: cir.if
+// CHECK: cir.if
+
+// SCF: scf.while

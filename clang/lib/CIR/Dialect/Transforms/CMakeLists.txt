@@ -13,6 +13,8 @@ add_clang_library(MLIRCIRTransforms
   LoweringPrepare.cpp
   GotoSolver.cpp
   IdiomRecognizer.cpp
+  LowerBreakContinue.cpp
+  ScrubIO.cpp
 
   DEPENDS
   MLIRCIRPassIncGen

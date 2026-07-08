@@ -32,6 +32,8 @@ std::unique_ptr<Pass> createHoistAllocasPass();
 std::unique_ptr<Pass> createLoweringPreparePass();
 std::unique_ptr<Pass> createLoweringPreparePass(clang::ASTContext *astCtx);
 std::unique_ptr<Pass> createGotoSolverPass();
+std::unique_ptr<Pass> createLowerBreakContinuePass();
+std::unique_ptr<Pass> createScrubIOPass();
 std::unique_ptr<Pass> createIdiomRecognizerPass();
 std::unique_ptr<Pass> createIdiomRecognizerPass(clang::ASTContext *astCtx);
 

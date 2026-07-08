@@ -1,18 +1,15 @@
-// REGRESSION GUARD (R-3, the historical for+continue silent miscompile).
+// R-3 REGRESSION GUARD (the historical for+continue silent miscompile).
 //
 // A `continue` in a C `for` loop must STILL execute the loop step (e.g. i++):
-// control jumps to the step, then the condition. The old ad-hoc flag machinery
-// appended the step to the body end and then guarded "everything after the
-// continue" with `if (!continue_flag)` -- which SWEPT THE STEP into the guard,
-// so the induction variable never advanced -> infinite loop / silent
-// miscompile.
+// control jumps to the step, then the condition. --cir-lower-break-continue
+// rewrites the continue into a body-local `cont` flag + guard-climb and leaves
+// the cond and step regions UNTOUCHED, so the step still runs on continue.
 //
-// Until a CFG-correct for+continue lowering lands (step OUTSIDE the guard),
-// this MUST be rejected with an honest diagnostic rather than miscompiled.
-// This test fails loudly if someone re-enables the miscompiling path without
-// moving the step out of the continue guard.
+// This test fails loudly if someone re-introduces a step-inside-the-guard
+// lowering: the step's increment must NOT sit inside a `cir.if` guard region.
 //
-// RUN: not cir-opt %s --cir-goto-solver --cir-canonicalize --cir-to-mlir 2>&1 | FileCheck %s
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue | FileCheck %s
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
 
 !s32i = !cir.int<s, 32>
 module {
@@ -54,5 +51,16 @@ module {
   }
 }
 
-// CHECK: error: ThroughMLIR: 'continue' inside a 'for' loop is not yet supported
-// CHECK-NOT: scf.while
+// The continue becomes a `cont` flag; the trailing body is guarded by if(!cont).
+// CHECK: cir.alloca {{.*}}"cont"
+// CHECK: cir.for : cond {
+// The step region is the LAST region and must NOT contain a guard `cir.if`:
+// the increment executes unconditionally on every iteration (incl. continue).
+// CHECK: } step {
+// CHECK-NOT: cir.if
+// CHECK: cir.inc
+// CHECK: }
+
+// Removing the continue makes the loop canonical again -> scf.for, and the
+// induction step is the scf.for step (unconditional), never a guarded body op.
+// SCF: scf.for
