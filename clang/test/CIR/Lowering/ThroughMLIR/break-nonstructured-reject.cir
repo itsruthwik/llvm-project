@@ -1,0 +1,26 @@
+// LowerBreakContinue: a loop-targeting break/continue in a NON-STRUCTURED
+// (multi-block) loop body cannot be restructured by the guard-climb rewrite and
+// is honestly rejected rather than silently mis-lowered.
+//
+// RUN: not cir-opt %s --cir-lower-break-continue 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f(%arg0: !s32i) {
+    %0 = cir.alloca "n" align(4) : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.while {
+      %1 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+      %2 = cir.const #cir.int<0> : !s32i
+      %3 = cir.cmp gt %1, %2 : !s32i
+      cir.condition(%3)
+    } do {
+      cir.br ^bb1
+    ^bb1:
+      cir.break
+    }
+    cir.return
+  }
+}
+
+// CHECK: break/continue in a non-structured (multi-block) loop body is not supported

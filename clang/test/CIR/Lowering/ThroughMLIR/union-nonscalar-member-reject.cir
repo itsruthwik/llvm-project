@@ -1,0 +1,17 @@
+// LowerUnionPunning: a union whose FIRST member is non-scalar (here an array)
+// cannot be scalarized into single scalar storage. Honest reject.
+//
+// RUN: not cir-opt %s --cir-lower-union-punning 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!u = !cir.union<"u" {!cir.array<!s32i x 2>, !s32i}>
+module {
+  cir.func @f() {
+    %0 = cir.alloca "t" align(8) : !cir.ptr<!u>
+    %1 = cir.get_member %0[1] {name = "b"} : !cir.ptr<!u> -> !cir.ptr<!s32i>
+    %2 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+    cir.return
+  }
+}
+
+// CHECK: has a non-scalar member

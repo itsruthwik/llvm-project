@@ -917,6 +917,32 @@ public:
       for (unsigned idx : chainOf(s))
         total[idx]++;
 
+    // A case body that is consumed by MORE THAN ONE arm is *moved* into its last
+    // consumer and *cloned* for the earlier ones. Cloning a region-bearing CIR
+    // op that still needs its own dialect conversion is unsound under the
+    // one-shot conversion driver: a cloned nested `cir.switch` defeats the
+    // move-on-last-use driver and aborts ("replace a root operation that has no
+    // parent block"). This bites the `any-of`/empty-case + fall-through +
+    // nested-`switch` shape (R2 s5.c). A single-consumer nested switch is fine
+    // (it is moved, never cloned). Reject the multi-consumer case up front with
+    // a named diagnostic rather than crash. (A real structured lowering would
+    // need to splice the nested switch in a CIR-level pre-pass or dispatch the
+    // shared chain once via a flag; deferred as its own item.)
+    for (auto &tc : total) {
+      if (tc.second <= 1)
+        continue; // single consumer -> moved, not cloned; safe.
+      bool hasNestedSwitch = false;
+      cases[tc.first].getCaseRegion().walk(
+          [&](cir::SwitchOp) { hasNestedSwitch = true; });
+      if (hasNestedSwitch)
+        return op.emitError(
+            "ThroughMLIR: a nested 'switch' inside a 'case' fall-through chain "
+            "that is shared by multiple case values (e.g. an 'any-of'/empty "
+            "case falling through into a case containing a nested 'switch') is "
+            "not supported by the CIR-to-MLIR lowering; give that case its own "
+            "'break'");
+    }
+
     auto emitArm = [&](unsigned startIdx, mlir::Region &region) {
       mlir::Block *block = rewriter.createBlock(&region);
       rewriter.setInsertionPointToStart(block);

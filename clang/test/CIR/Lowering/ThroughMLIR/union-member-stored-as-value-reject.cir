@@ -1,0 +1,19 @@
+// LowerUnionPunning: the ADDRESS of a union member stored as a value (escaping
+// into a pointer slot) cannot be soundly scalarized -- the stored address would
+// outlive the single-scalar rewrite. Honest reject.
+//
+// RUN: not cir-opt %s --cir-lower-union-punning 2>&1 | FileCheck %s
+
+!u64i = !cir.int<u, 64>
+!u = !cir.union<"u" {!cir.double, !u64i}>
+module {
+  cir.func @f() {
+    %0 = cir.alloca "t" align(8) : !cir.ptr<!u>
+    %1 = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!u64i>>
+    %2 = cir.get_member %0[1] {name = "ll"} : !cir.ptr<!u> -> !cir.ptr<!u64i>
+    cir.store %2, %1 : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+    cir.return
+  }
+}
+
+// CHECK: escapes (stored as a value)

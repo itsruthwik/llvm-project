@@ -1,0 +1,18 @@
+// LowerUnionPunning: the whole-union alloca escaping (used by something other
+// than a member access -- here passed by address to a call) cannot be
+// scalarized. Honest reject.
+//
+// RUN: not cir-opt %s --cir-lower-union-punning 2>&1 | FileCheck %s
+
+!u64i = !cir.int<u, 64>
+!u = !cir.union<"u" {!cir.double, !u64i}>
+module {
+  cir.func private @sink(!cir.ptr<!u>)
+  cir.func @f() {
+    %0 = cir.alloca "t" align(8) : !cir.ptr<!u>
+    cir.call @sink(%0) : (!cir.ptr<!u>) -> ()
+    cir.return
+  }
+}
+
+// CHECK: used other than by member access

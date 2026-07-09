@@ -1,0 +1,28 @@
+// LowerReturn: an early return nested in a NON-STRUCTURED (multi-block) function
+// body cannot be rewritten into single-exit form by the guard-climb and is
+// honestly rejected rather than mis-lowered (which would place a func.return
+// inside an scf region). This exercises LowerReturn's OWN diagnostic (the
+// existing return-in-loop-reject.cir checks the older monolithic path instead).
+//
+// RUN: not cir-opt %s --cir-lower-return 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @g(%arg0: !s32i) -> !s32i {
+    %0 = cir.alloca "n" align(4) : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.br ^bb1
+  ^bb1:
+    %1 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+    %2 = cir.const #cir.int<0> : !s32i
+    %3 = cir.cmp gt %1, %2 : !s32i
+    cir.if %3 {
+      %z = cir.const #cir.int<0> : !s32i
+      cir.return %z : !s32i
+    }
+    %4 = cir.const #cir.int<1> : !s32i
+    cir.return %4 : !s32i
+  }
+}
+
+// CHECK: early 'return' in a non-structured (multi-block) function body is not supported

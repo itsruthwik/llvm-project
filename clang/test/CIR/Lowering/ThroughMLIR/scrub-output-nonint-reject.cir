@@ -1,0 +1,17 @@
+// ScrubIO: an output sink (printf) whose CONSUMED result is non-integer cannot
+// be soundly replaced with a constant 0 (only an integer byte-count return is).
+// Honest reject rather than a silent wrong substitution.
+//
+// RUN: not cir-opt %s --cir-scrub-io 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func private @printf(!cir.ptr<!s32i>) -> !cir.double
+  cir.func @f() -> !cir.double {
+    %0 = cir.alloca "fmt" align(8) : !cir.ptr<!s32i>
+    %1 = cir.call @printf(%0) : (!cir.ptr<!s32i>) -> !cir.double
+    cir.return %1 : !cir.double
+  }
+}
+
+// CHECK: has a consumed non-integer result
