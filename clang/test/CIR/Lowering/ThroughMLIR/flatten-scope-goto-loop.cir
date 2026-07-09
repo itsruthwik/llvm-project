@@ -1,8 +1,8 @@
 // Cross-scope forward-exit goto OUT OF a loop: the goto jumps forward from
 // inside a cir.for to a shared epilogue label at function-body level. Besides
 // the flag + guard-climb, --cir-flatten-scope-goto strengthens the enclosing
-// loop's condition with `cir.select if flag then false else C` (and guards the
-// for-step) so the goto terminates the loop -- the same treatment as an early
+// loop's condition lazily with `flag ? false : C` (C sunk into the ternary's
+// false region) (and guards the for-step) so the goto terminates the loop -- the same treatment as an early
 // return that breaks out of the loop. Guards against the historical
 // step-execution miscompile.
 //
@@ -12,8 +12,9 @@
 // CHECK-LABEL: cir.func {{.*}}@loop_goto
 // CHECK: cir.alloca "goto_done"
 // CHECK-NOT: cir.goto
-// Loop condition strengthened with a select on the flag.
-// CHECK: cir.select
+// Loop condition strengthened with a lazy ternary on the flag.
+// CHECK: cir.ternary
+// CHECK: cir.const #false
 
 // SCF-LABEL: func.func @loop_goto
 // SCF-NOT: cir.goto

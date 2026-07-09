@@ -39,6 +39,7 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Dialect/Passes.h"
+#include "clang/CIR/Dialect/Transforms/ControlFlowGuards.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <memory>
@@ -62,20 +63,6 @@ static mlir::Region *loopBodyRegion(mlir::Operation *loop) {
   if (auto d = dyn_cast<cir::DoWhileOp>(loop))
     return &d.getBody();
   return nullptr;
-}
-
-// The single-block cond region terminator (cir.condition) of a for/while/do.
-static cir::ConditionOp loopCondition(mlir::Operation *loop) {
-  mlir::Region *cond = nullptr;
-  if (auto f = dyn_cast<cir::ForOp>(loop))
-    cond = &f.getCond();
-  else if (auto w = dyn_cast<cir::WhileOp>(loop))
-    cond = &w.getCond();
-  else if (auto d = dyn_cast<cir::DoWhileOp>(loop))
-    cond = &d.getCond();
-  if (!cond || cond->empty())
-    return nullptr;
-  return dyn_cast<cir::ConditionOp>(cond->front().getTerminator());
 }
 
 // Does `brk` target `loop` (nearest enclosing loop, stopping at a switch)?
@@ -118,33 +105,6 @@ struct LowerBreakContinuePass
 
   bool failed = false;
 
-  // Guard the ops that follow `runner` (within runner's block, up to the block
-  // terminator) inside a fresh `if(!flag) { ... }`. Returns nothing; a no-op if
-  // there is nothing to guard.
-  void wrapTrailing(mlir::Operation *runner, mlir::Value flagAddr,
-                    mlir::Type boolTy) {
-    mlir::Operation *first = runner->getNextNode();
-    if (!first || first->hasTrait<mlir::OpTrait::IsTerminator>())
-      return; // nothing after `runner` but the terminator
-    mlir::OpBuilder b(runner->getContext());
-    b.setInsertionPointAfter(runner);
-    auto loc = runner->getLoc();
-    mlir::Value flag = cir::LoadOp::create(b, loc, boolTy, flagAddr);
-    mlir::Value notFlag = cir::NotOp::create(b, loc, boolTy, flag);
-    auto ifnot = cir::IfOp::create(b, loc, notFlag, /*withElseRegion=*/false,
-                                   [](mlir::OpBuilder &, mlir::Location) {});
-    mlir::Block &then = ifnot.getThenRegion().back();
-    b.setInsertionPointToEnd(&then);
-    auto term = cir::YieldOp::create(b, loc);
-    for (mlir::Operation *o = ifnot->getNextNode(); o;) {
-      if (o->hasTrait<mlir::OpTrait::IsTerminator>())
-        break;
-      mlir::Operation *next = o->getNextNode();
-      o->moveBefore(term);
-      o = next;
-    }
-  }
-
   // Replace one break/continue op with `store true, flag` and guard-climb every
   // op after it (at each ancestor level up to the loop body) inside `if(!flag)`.
   void rewriteSite(mlir::Operation *site, mlir::Value flagAddr,
@@ -164,36 +124,7 @@ struct LowerBreakContinuePass
       cir::YieldOp::create(tb, loc);
     }
     // Climb from the store up to the loop body block, guarding trailing ops.
-    mlir::Operation *runner = store;
-    while (runner->getBlock() != bodyBlock) {
-      wrapTrailing(runner, flagAddr, boolTy);
-      runner = runner->getParentOp();
-      if (!runner) // defensive: should always reach the body block
-        return;
-    }
-    wrapTrailing(runner, flagAddr, boolTy);
-  }
-
-  // Guard every op in `block` (except its terminator) inside `if(!flag)`.
-  void guardBlock(mlir::Block *block, mlir::Value flagAddr, mlir::Type boolTy,
-                  mlir::Location loc) {
-    mlir::Operation *term = block->getTerminator();
-    llvm::SmallVector<mlir::Operation *> ops;
-    for (mlir::Operation &o : *block)
-      if (&o != term)
-        ops.push_back(&o);
-    if (ops.empty())
-      return;
-    mlir::OpBuilder b(block, block->begin());
-    mlir::Value flag = cir::LoadOp::create(b, loc, boolTy, flagAddr);
-    mlir::Value notFlag = cir::NotOp::create(b, loc, boolTy, flag);
-    auto ifnot = cir::IfOp::create(b, loc, notFlag, /*withElseRegion=*/false,
-                                   [](mlir::OpBuilder &, mlir::Location) {});
-    mlir::Block &then = ifnot.getThenRegion().back();
-    mlir::OpBuilder tb(&then, then.end());
-    auto yield = cir::YieldOp::create(tb, loc);
-    for (mlir::Operation *o : ops)
-      o->moveBefore(yield);
+    cir::climbGuard(store, flagAddr, boolTy, bodyBlock);
   }
 
   // Create a `!cir.bool` alloca initialised to false immediately before `loop`.
@@ -274,29 +205,16 @@ struct LowerBreakContinuePass
       for (auto brkOp : breaks)
         rewriteSite(brkOp, brk, boolTy, bodyBlock);
 
-      // Strengthen the loop condition: %c = select if brk then false else %C.
-      if (auto condOp = loopCondition(loop)) {
-        mlir::OpBuilder b(condOp);
-        auto loc = condOp.getLoc();
-        mlir::Value brkVal = cir::LoadOp::create(b, loc, boolTy, brk);
-        mlir::Value falseVal = cir::ConstantOp::create(
-            b, loc, cir::BoolAttr::get(&getContext(), false));
-        mlir::Value orig = condOp.getCondition();
-        mlir::Value sel = cir::SelectOp::create(b, loc, boolTy, brkVal,
-                                                falseVal, orig);
-        condOp.getConditionMutable().assign(sel);
-      } else {
-        loop->emitError("ThroughMLIR: loop with 'break' has no structured "
-                        "condition region to strengthen");
+      // Strengthen the loop condition so the loop terminates once brk is set --
+      // re-evaluating the original condition lazily (side-effect-once) -- and
+      // (for a `for`) skip the step on break. Shared with LowerReturn /
+      // FlattenScopeGoto.
+      if (mlir::failed(cir::strengthenLoopExit(
+              loop, brk, boolTy,
+              "ThroughMLIR: loop with 'break' has no structured condition "
+              "region to strengthen"))) {
         failed = true;
         return;
-      }
-
-      // for-loop STEP must be SKIPPED on break: wrap the step body in if(!brk).
-      if (auto forOp = dyn_cast<cir::ForOp>(loop)) {
-        mlir::Region &step = forOp.getStep();
-        if (!step.empty() && step.hasOneBlock())
-          guardBlock(&step.front(), brk, boolTy, forOp.getLoc());
       }
     }
   }

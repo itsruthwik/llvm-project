@@ -52,6 +52,7 @@ module {
 
 // CHECK: cir.alloca {{.*}}"returning"
 // CHECK-NOT: cir.alloca {{.*}}"retval"
-// CHECK: cir.select if
+// CHECK: cir.ternary
+// CHECK: cir.const #false
 // SCF: func.func @f
 // SCF: return

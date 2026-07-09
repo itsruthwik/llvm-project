@@ -50,7 +50,8 @@ module {
 
 // CHECK: cir.alloca {{.*}}"returning"
 // CHECK: cir.for : cond {
-// CHECK: cir.select if
+// CHECK: cir.ternary
+// CHECK: cir.const #false
 // The step region is guarded so it is skipped on return.
 // CHECK: } step {
 // CHECK-NEXT: cir.load

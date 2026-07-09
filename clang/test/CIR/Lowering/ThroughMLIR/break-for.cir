@@ -1,4 +1,4 @@
-// break-in-for: the loop condition is strengthened with cir.select and the
+// break-in-for: the loop condition is strengthened with a lazy cir.ternary and the
 // STEP region body is wrapped in `if(!brk)` so the step is SKIPPED on break
 // (the break asymmetry). Then it lowers cleanly to scf.
 //
@@ -45,9 +45,12 @@ module {
 }
 
 // CHECK: cir.alloca {{.*}}"brk"
-// The condition is strengthened: select if brk then false else <cmp>.
+// The condition is strengthened lazily: brk ? false : <cmp>, with <cmp> sunk
+// into the ternary's false region (evaluated only when brk is clear).
 // CHECK: cir.for : cond {
-// CHECK: cir.select if
+// CHECK: cir.ternary
+// CHECK: cir.const #false
+// CHECK: false {
 // CHECK: cir.condition
 // The step is guarded so it is SKIPPED on break.
 // CHECK: } step {

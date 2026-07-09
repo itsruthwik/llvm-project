@@ -1,5 +1,7 @@
-// break-in-while: the while condition is strengthened with cir.select; there
-// is no step region. Lowers cleanly to scf.while.
+// break-in-while: the while condition is strengthened LAZILY -- `%c = brk ?
+// false : C`, with C's computation sunk into the ternary's false region so a
+// side-effecting condition would not re-run after break. There is no step
+// region. Lowers cleanly to scf.while.
 //
 // RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue | FileCheck %s
 // RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
@@ -40,7 +42,9 @@ module {
 
 // CHECK: cir.alloca {{.*}}"brk"
 // CHECK: cir.while {
-// CHECK: cir.select if
+// CHECK: cir.ternary
+// CHECK: cir.const #false
+// CHECK: false {
 // CHECK: cir.condition
 // After the break's if, the rest of the body is guarded by if(!brk).
 // CHECK: cir.if

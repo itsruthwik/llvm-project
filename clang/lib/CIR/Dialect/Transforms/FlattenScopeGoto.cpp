@@ -46,6 +46,7 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Dialect/Passes.h"
+#include "clang/CIR/Dialect/Transforms/ControlFlowGuards.h"
 #include "clang/CIR/Dialect/Transforms/GotoClassify.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
@@ -63,76 +64,12 @@ namespace mlir {
 
 namespace {
 
-// The single-block cond region terminator (cir.condition) of a for/while/do.
-static cir::ConditionOp loopCondition(mlir::Operation *loop) {
-  mlir::Region *cond = nullptr;
-  if (auto f = dyn_cast<cir::ForOp>(loop))
-    cond = &f.getCond();
-  else if (auto w = dyn_cast<cir::WhileOp>(loop))
-    cond = &w.getCond();
-  else if (auto d = dyn_cast<cir::DoWhileOp>(loop))
-    cond = &d.getCond();
-  if (!cond || cond->empty())
-    return nullptr;
-  return dyn_cast<cir::ConditionOp>(cond->front().getTerminator());
-}
-
 struct FlattenScopeGotoPass
     : public impl::FlattenScopeGotoBase<FlattenScopeGotoPass> {
   FlattenScopeGotoPass() = default;
   void runOnOperation() override;
 
   bool failed = false;
-
-  // Guard the ops that follow `runner` (within runner's block, up to the block
-  // terminator) inside a fresh `cir.if(!flag) { ... }`. No-op if there is
-  // nothing to guard. Lifted verbatim from LowerReturn.
-  void wrapTrailing(mlir::Operation *runner, mlir::Value flagAddr,
-                    mlir::Type boolTy) {
-    mlir::Operation *first = runner->getNextNode();
-    if (!first || first->hasTrait<mlir::OpTrait::IsTerminator>())
-      return; // nothing after `runner` but the terminator
-    mlir::OpBuilder b(runner->getContext());
-    b.setInsertionPointAfter(runner);
-    auto loc = runner->getLoc();
-    mlir::Value flag = cir::LoadOp::create(b, loc, boolTy, flagAddr);
-    mlir::Value notFlag = cir::NotOp::create(b, loc, boolTy, flag);
-    auto ifnot = cir::IfOp::create(b, loc, notFlag, /*withElseRegion=*/false,
-                                   [](mlir::OpBuilder &, mlir::Location) {});
-    mlir::Block &then = ifnot.getThenRegion().back();
-    b.setInsertionPointToEnd(&then);
-    auto term = cir::YieldOp::create(b, loc);
-    for (mlir::Operation *o = ifnot->getNextNode(); o;) {
-      if (o->hasTrait<mlir::OpTrait::IsTerminator>())
-        break;
-      mlir::Operation *next = o->getNextNode();
-      o->moveBefore(term);
-      o = next;
-    }
-  }
-
-  // Guard every op in `block` (except its terminator) inside `cir.if(!flag)`.
-  // Used to skip a `for` step region when the goto fires. From LowerReturn.
-  void guardBlock(mlir::Block *block, mlir::Value flagAddr, mlir::Type boolTy,
-                  mlir::Location loc) {
-    mlir::Operation *term = block->getTerminator();
-    llvm::SmallVector<mlir::Operation *> ops;
-    for (mlir::Operation &o : *block)
-      if (&o != term)
-        ops.push_back(&o);
-    if (ops.empty())
-      return;
-    mlir::OpBuilder b(block, block->begin());
-    mlir::Value flag = cir::LoadOp::create(b, loc, boolTy, flagAddr);
-    mlir::Value notFlag = cir::NotOp::create(b, loc, boolTy, flag);
-    auto ifnot = cir::IfOp::create(b, loc, notFlag, /*withElseRegion=*/false,
-                                   [](mlir::OpBuilder &, mlir::Location) {});
-    mlir::Block &then = ifnot.getThenRegion().back();
-    mlir::OpBuilder tb(&then, then.end());
-    auto yield = cir::YieldOp::create(tb, loc);
-    for (mlir::Operation *o : ops)
-      o->moveBefore(yield);
-  }
 
   // Create a `!cir.bool` flag alloca initialised to false at the top of the
   // function body block.
@@ -146,33 +83,6 @@ struct FlattenScopeGotoPass
         b, loc, cir::BoolAttr::get(&getContext(), false));
     cir::StoreOp::create(b, loc, falseVal, addr);
     return addr;
-  }
-
-  // Strengthen a loop so it terminates once `flag` is set (condition select +
-  // for-step guard). Identical to the early-return treatment.
-  void strengthenLoop(mlir::Operation *loop, mlir::Value flagAddr,
-                      mlir::Type boolTy) {
-    if (auto condOp = loopCondition(loop)) {
-      mlir::OpBuilder b(condOp);
-      auto loc = condOp.getLoc();
-      mlir::Value flag = cir::LoadOp::create(b, loc, boolTy, flagAddr);
-      mlir::Value falseVal = cir::ConstantOp::create(
-          b, loc, cir::BoolAttr::get(&getContext(), false));
-      mlir::Value orig = condOp.getCondition();
-      mlir::Value sel =
-          cir::SelectOp::create(b, loc, boolTy, flag, falseVal, orig);
-      condOp.getConditionMutable().assign(sel);
-    } else {
-      loop->emitError("ThroughMLIR: loop enclosing a cross-scope 'goto' has no "
-                      "structured condition region to strengthen");
-      failed = true;
-      return;
-    }
-    if (auto forOp = dyn_cast<cir::ForOp>(loop)) {
-      mlir::Region &step = forOp.getStep();
-      if (!step.empty() && step.hasOneBlock())
-        guardBlock(&step.front(), flagAddr, boolTy, forOp.getLoc());
-    }
   }
 
   // Materialize one clean goto IN PLACE (no climb yet): set flag=true, erase the
@@ -192,22 +102,6 @@ struct FlattenScopeGotoPass
       cir::YieldOp::create(tb, loc);
     }
     return flagStore;
-  }
-
-  // Guard-climb from `anchor` up to (and including) `entryBlock`, guarding the
-  // trailing ops at every ancestor level in `cir.if(!flag)`. The entry block's
-  // own terminator (the `cir.br` to the epilogue) is never wrapped, so control
-  // always reaches the epilogue.
-  void climb(mlir::Operation *anchor, mlir::Value flagAddr, mlir::Type boolTy,
-             mlir::Block *entryBlock) {
-    mlir::Operation *runner = anchor;
-    while (runner->getBlock() != entryBlock) {
-      wrapTrailing(runner, flagAddr, boolTy);
-      runner = runner->getParentOp();
-      if (!runner)
-        return; // defensive: classifier guarantees we reach entryBlock
-    }
-    wrapTrailing(runner, flagAddr, boolTy);
   }
 
   // Collect the loops enclosing `gotoOp` up to and including the outermost
@@ -292,14 +186,19 @@ struct FlattenScopeGotoPass
       anchors.push_back(materializeGoto(g, flag));
     }
     for (size_t i = 0; i < anchors.size(); ++i)
-      climb(anchors[i], anchorFlag[i], boolTy, anchorEntry[i]);
+      cir::climbGuard(anchors[i], anchorFlag[i], boolTy, anchorEntry[i]);
 
     // Strengthen each enclosing loop for every flag whose goto it encloses (a
-    // loop shared by two labels is strengthened for both -- composed selects).
+    // loop shared by two labels is strengthened for both -- composed lazy
+    // ternaries). Shared with LowerBreakContinue / LowerReturn.
     for (auto &lf : loopFlagPairs) {
-      strengthenLoop(lf.first, lf.second, boolTy);
-      if (failed)
+      if (mlir::failed(cir::strengthenLoopExit(
+              lf.first, lf.second, boolTy,
+              "ThroughMLIR: loop enclosing a cross-scope 'goto' has no "
+              "structured condition region to strengthen"))) {
+        failed = true;
         return;
+      }
     }
   }
 };

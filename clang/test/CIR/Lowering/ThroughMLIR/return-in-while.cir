@@ -46,7 +46,8 @@ module {
 // CHECK: cir.alloca {{.*}}"returning"
 // CHECK: cir.alloca {{.*}}"retval"
 // CHECK: cir.while {
-// CHECK: cir.select if
+// CHECK: cir.ternary
+// CHECK: cir.const #false
 // CHECK: cir.condition
 // A single func-level return remains after lowering.
 // SCF: func.func @f

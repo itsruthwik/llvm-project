@@ -1,0 +1,67 @@
+// P0 regression (side-effecting FOR condition + break). `for(; n-- > 0; i++)`
+// with a break: --cir-lower-break-continue must (a) strengthen the condition
+// lazily so the decrement in `n--` is sunk into the ternary false region and
+// does not re-run after break, and (b) still guard the STEP so it is skipped on
+// break. Numeric oracle: incrementH-artifacts/oracle.sh (for_ndec_break.c).
+//
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue | FileCheck %s
+// RUN: cir-opt %s --cir-goto-solver --cir-canonicalize --cir-lower-break-continue --cir-lower-return --cir-canonicalize --cir-to-mlir | FileCheck %s --check-prefix=SCF
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f() -> !s32i {
+    %0 = cir.alloca "n" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "c" align(4) init : !cir.ptr<!s32i>
+    %2 = cir.alloca "i" align(4) : !cir.ptr<!s32i>
+    %3 = cir.const #cir.int<5> : !s32i
+    cir.store %3, %0 : !s32i, !cir.ptr<!s32i>
+    %4 = cir.const #cir.int<0> : !s32i
+    cir.store %4, %1 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.const #cir.int<0> : !s32i
+      cir.store %6, %2 : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %7 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+        %8 = cir.dec nsw %7 : !s32i
+        cir.store %8, %0 : !s32i, !cir.ptr<!s32i>
+        %9 = cir.const #cir.int<0> : !s32i
+        %10 = cir.cmp gt %7, %9 : !s32i
+        cir.condition(%10)
+      } body {
+        cir.scope {
+          %7 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+          %8 = cir.inc nsw %7 : !s32i
+          cir.store %8, %1 : !s32i, !cir.ptr<!s32i>
+          %9 = cir.const #cir.int<2> : !s32i
+          %11 = cir.cmp eq %8, %9 : !s32i
+          cir.if %11 {
+            cir.break
+          }
+        }
+        cir.yield
+      } step {
+        %7 = cir.load %2 : !cir.ptr<!s32i>, !s32i
+        %8 = cir.inc nsw %7 : !s32i
+        cir.store %8, %2 : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %5 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+    cir.return %5 : !s32i
+  }
+}
+
+// Condition strengthened lazily (decrement sunk into the ternary false region).
+// CHECK: cir.for : cond {
+// CHECK: cir.ternary
+// CHECK: }, false {
+// CHECK: cir.dec
+// CHECK: cir.store
+// CHECK: cir.cmp gt
+// CHECK: cir.yield
+// CHECK: cir.condition
+// Step guarded so it is SKIPPED on break.
+// CHECK: } step {
+// CHECK: cir.if
+
+// SCF: scf.while

@@ -75,8 +75,10 @@ module {
 }
 
 // CHECK: cir.alloca {{.*}}"returning"
-// Two condition-strengthening selects, one per enclosing loop.
-// CHECK: cir.select if
-// CHECK: cir.select if
+// Two condition-strengthening lazy ternaries, one per enclosing loop.
+// CHECK: cir.ternary
+// CHECK: cir.const #false
+// CHECK: cir.ternary
+// CHECK: cir.const #false
 // SCF: func.func @f
 // SCF: return
