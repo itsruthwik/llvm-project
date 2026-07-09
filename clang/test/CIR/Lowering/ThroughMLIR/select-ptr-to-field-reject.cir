@@ -1,0 +1,21 @@
+// A conditional pointer-to-field: a `cir.select` that chooses at runtime between
+// the addresses of two DIFFERENT record members (`cir.get_member`). The two
+// field addresses have no single memref index, so this leaks a ptr->memref
+// materialization error today. It is honestly REJECTED with a named diagnostic.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!rec = !cir.struct<"P" {!s32i, !s32i}>
+module {
+  cir.func @k(%c: !cir.bool) -> !s32i {
+    %0 = cir.alloca "p" align(4) : !cir.ptr<!rec>
+    %f0 = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec> -> !cir.ptr<!s32i>
+    %f1 = cir.get_member %0[1] {name = "b"} : !cir.ptr<!rec> -> !cir.ptr<!s32i>
+    %sel = cir.select if %c then %f0 else %f1 : (!cir.bool, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+    %v = cir.load %sel : !cir.ptr<!s32i>, !s32i
+    cir.return %v : !s32i
+  }
+}
+
+// CHECK: conditional pointer-to-field

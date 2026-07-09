@@ -1,0 +1,29 @@
+// P1 regression: a pointer-cursor step over a LOCAL array (`*p++` idiom — a
+// constant-stride ptr_stride whose reinterpret_cast offset constifies to a
+// STATIC attribute) used to CRASH `eraseIfSafe` at `reinterpretOp.getOffsets()[0]`,
+// because getOffsets() returns only the DYNAMIC offset operands and is empty for
+// a static offset. The fix compares the load/store index against
+// getConstifiedMixedOffset(), handling static, dynamic and mixed offsets
+// uniformly. Two loads of the same strided pointer force the multi-user
+// erase-accounting path. Expected outcome for THIS phase: lowers WITHOUT an
+// assertion/crash (value correctness of stored-cursor loops is Phase 2).
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module {
+  cir.func @k() -> !s32i {
+    %arr = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 8>>
+    %p = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    %c1 = cir.const #cir.int<1> : !s64i
+    %q = cir.ptr_stride %p, %c1 : (!cir.ptr<!s32i>, !s64i) -> !cir.ptr<!s32i>
+    %v0 = cir.load %q : !cir.ptr<!s32i>, !s32i
+    %v1 = cir.load %q : !cir.ptr<!s32i>, !s32i
+    %s = cir.add %v0, %v1 : !s32i
+    cir.return %s : !s32i
+  }
+}
+
+// CHECK: func.func @k
+// CHECK: memref.load

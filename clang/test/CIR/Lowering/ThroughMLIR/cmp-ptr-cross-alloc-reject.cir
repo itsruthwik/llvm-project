@@ -1,0 +1,23 @@
+// A RELATIONAL pointer comparison (`p < q`, and likewise <=, >, >=) between
+// pointers into DISTINCT allocations is undefined ordering in hardware (the two
+// arrays become independent memories). Only the cross-allocation arm is
+// rejected: the same-allocation wrap-around-cursor idiom (`if (p >= end)`) keeps
+// its correct address-offset lowering (see cmp-ptr-same-base.cir). Here both
+// operands trace through array-to-ptrdecay casts to two different allocas, so
+// the cross-allocation is statically provable.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @k() -> !cir.bool {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 4>>
+    %b = cir.alloca "b" align(16) : !cir.ptr<!cir.array<!s32i x 4>>
+    %pa = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %pb = cir.cast array_to_ptrdecay %b : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %c = cir.cmp lt %pa, %pb : !cir.ptr<!s32i>
+    cir.return %c : !cir.bool
+  }
+}
+
+// CHECK: relational comparison{{.*}}of pointers into distinct allocations

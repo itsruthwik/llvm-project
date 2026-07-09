@@ -1,0 +1,24 @@
+// A partial N-D `cir.get_element` chain: indexing only the OUTER dimension of a
+// 2-D array yields an intermediate ROW pointer `!cir.ptr<!cir.array<T x N>>`.
+// When that row pointer ESCAPES as a value — here passed whole to a call — it
+// cannot be collapsed into a single multi-index memref access, and today leaks a
+// ptr->memref materialization error. It is honestly REJECTED with a named
+// diagnostic. (A row pointer that is only further indexed by another
+// get_element is fine and is chain-collapsed; see nd-getelement-chain-collapse.)
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!row = !cir.ptr<!cir.array<!s32i x 4>>
+module {
+  cir.func private @sink(!row)
+  cir.func @k(%i: !s64i) {
+    %m = cir.alloca "m" align(16) : !cir.ptr<!cir.array<!cir.array<!s32i x 4> x 8>>
+    %r = cir.get_element %m[%i : !s64i] : !cir.ptr<!cir.array<!cir.array<!s32i x 4> x 8>> -> !cir.ptr<!cir.array<!s32i x 4>>
+    cir.call @sink(%r) : (!row) -> ()
+    cir.return
+  }
+}
+
+// CHECK: intermediate row pointer of a multi-dimensional array

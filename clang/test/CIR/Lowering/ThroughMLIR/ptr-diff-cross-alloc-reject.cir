@@ -1,0 +1,23 @@
+// Pointer difference (`p - q`) between pointers into DISTINCT allocations has no
+// defined element distance in hardware (the two arrays become independent
+// memories). It is honestly REJECTED with a named diagnostic — never lowered to
+// an opaque "failed to legalize unresolved materialization '!cir.int'" leak.
+// The base of each operand is traced through the array-to-ptrdecay casts to two
+// different `cir.alloca`s, so the cross-allocation is statically provable.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module {
+  cir.func @k() -> !s64i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 4>>
+    %b = cir.alloca "b" align(16) : !cir.ptr<!cir.array<!s32i x 4>>
+    %pa = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %pb = cir.cast array_to_ptrdecay %b : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %d = cir.ptr_diff %pa, %pb : !cir.ptr<!s32i> -> !s64i
+    cir.return %d : !s64i
+  }
+}
+
+// CHECK: pointer difference across distinct allocations is not supported

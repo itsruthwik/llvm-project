@@ -1,0 +1,22 @@
+// A genuine indirect call through a runtime function pointer (here the callee is
+// a function-pointer ARGUMENT, not a get_global of a defined symbol) has no
+// hardware realization and previously leaked "failed to legalize unresolved
+// materialization '!cir.int<s, 32>'" because the func-pointer callee operand is
+// unconvertible and the indirect-call pattern is never reached. An up-front
+// legality check now REJECTS it with a named diagnostic. The no-prototype / K&R
+// direct-call shape (callee = get_global of a defined function used only as a
+// callee) is NOT affected — it is still folded to a direct func.call (see
+// knr-noproto-call-fold.cir).
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!fnptr = !cir.ptr<!cir.func<() -> !s32i>>
+module {
+  cir.func @k(%fp: !fnptr) -> !s32i {
+    %r = cir.call %fp() : (!fnptr) -> !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// CHECK: indirect call / function pointer is not supported

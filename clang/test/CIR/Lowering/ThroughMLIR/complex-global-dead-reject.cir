@@ -1,0 +1,16 @@
+// A complex-typed global initializer is not yet lowerable (upstream removed
+// lowerConstComplexAttr). CIRGlobalOpLowering emits a named diagnostic, but for
+// a DEAD global (no consumer) the partial conversion leaves the cir.global
+// unconverted and the pass would otherwise exit 0. The leftover-global
+// escalation in runOnOperation turns any surviving cir.global into a hard pass
+// FAILURE, so the process exits nonzero (checked here with `not cir-opt`) rather
+// than silently succeeding on an unlowered global.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!cdouble = !cir.complex<!cir.double>
+module {
+  cir.global external @z = #cir.const_complex<#cir.fp<1.000000e+00> : !cir.double, #cir.fp<2.000000e+00> : !cir.double> : !cdouble
+}
+
+// CHECK: complex global initializer is not yet implemented

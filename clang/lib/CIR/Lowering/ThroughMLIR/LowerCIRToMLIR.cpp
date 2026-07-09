@@ -39,6 +39,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Region.h"
@@ -444,6 +445,29 @@ static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
   return true;
 }
 
+// Return true if the (index-typed) load/store index `indexVal` refers to the
+// same offset the reinterpret_cast forwards. The reinterpret_cast offset may be
+// STATIC (an integer attribute, so getOffsets() — which returns only the
+// *dynamic* offset operands — is empty) or DYNAMIC (an SSA operand). Using
+// getMixedOffsets()/getConstifiedMixedOffset() handles both uniformly:
+//  - dynamic offset  → compare SSA values;
+//  - static offset   → compare against the constant the index materializes to.
+static bool indexMatchesReinterpretOffset(mlir::Value indexVal,
+                                          mlir::memref::ReinterpretCastOp op) {
+  mlir::OpFoldResult offset = op.getConstifiedMixedOffset();
+  if (auto offVal = llvm::dyn_cast<mlir::Value>(offset))
+    return indexVal == offVal;
+  // Static offset: match iff the index is a constant with the same value.
+  auto offAttr = llvm::dyn_cast<mlir::Attribute>(offset);
+  auto offInt = llvm::dyn_cast_or_null<mlir::IntegerAttr>(offAttr);
+  if (!offInt)
+    return false;
+  llvm::APInt idxConst;
+  if (mlir::matchPattern(indexVal, mlir::m_ConstantInt(&idxConst)))
+    return idxConst == offInt.getValue();
+  return false;
+}
+
 // If the memref.reinterpret_cast has multiple users (i.e the original
 // cir.ptr_stride op has multiple users), only erase the operation after the
 // last load or store has been generated.
@@ -463,8 +487,8 @@ static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
         if (auto reinterpretOp =
                 mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(
                     eraseList.back())) {
-          auto strideVal = loadOpUser.getIndices()[0];
-          if (strideVal == reinterpretOp.getOffsets()[0])
+          if (indexMatchesReinterpretOffset(loadOpUser.getIndices()[0],
+                                            reinterpretOp))
             ++newUsedNum;
         } else if (auto castOp =
                        mlir::dyn_cast<mlir::memref::CastOp>(eraseList.back()))
@@ -476,8 +500,8 @@ static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
         if (auto reinterpretOp =
                 mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(
                     eraseList.back())) {
-          auto strideVal = storeOpUser.getIndices()[0];
-          if (strideVal == reinterpretOp.getOffsets()[0])
+          if (indexMatchesReinterpretOffset(storeOpUser.getIndices()[0],
+                                            reinterpretOp))
             ++newUsedNum;
         } else if (auto castOp =
                        mlir::dyn_cast<mlir::memref::CastOp>(eraseList.back()))
@@ -1717,7 +1741,17 @@ public:
     const auto CIRSymType = op.getSymType();
     auto convertedType = convertTypeForMemory(*getTypeConverter(), CIRSymType);
     if (!convertedType)
-      return mlir::failure();
+      // The global's type has no memref lowering (e.g. a record/struct with no
+      // flattenable representation, or a record punned to multiple distinct
+      // array types so detectPunnedArrayGlobal declined). Fail loudly with a
+      // named diagnostic instead of returning silently — a silent failure here
+      // combined with a dead global would exit 0 (see the leftover-global
+      // escalation in runOnOperation).
+      return op.emitError("ThroughMLIR: global @")
+             << op.getSymName()
+             << " has a type with no memref lowering (a record/struct with no "
+                "flattenable representation, or an ambiguous type-pun); this "
+                "belongs to the struct-lowering cluster";
     auto memrefType = mlir::dyn_cast<mlir::MemRefType>(convertedType);
     if (!memrefType) {
       auto maybeAddrSpace = getTypeConverter()->convertTypeAttribute(
@@ -2879,6 +2913,80 @@ struct SCFPrepHoistLoopInvariant : public mlir::OpRewritePattern<cir::ForOp> {
 
 } // namespace
 
+// Trace a CIR pointer SSA value back to the memory object it is derived from
+// (a `cir.alloca` or a `cir.get_global`), walking through the address-producing
+// ops that merely re-base an existing pointer while preserving provenance.
+// Returns the defining op of the base object, or nullptr when the base cannot
+// be resolved statically (block argument / function parameter, an int-to-ptr
+// cast, or any other unknown pointer producer). Shared by the cross-allocation
+// legality checks (pointer difference, relational pointer compare) below; the
+// nullptr ("unresolvable") result is deliberately treated as "do not reject" by
+// every caller, so these checks never over-reject a provenance they cannot see.
+static mlir::Operation *traceCIRPointerBase(mlir::Value v) {
+  while (v) {
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def)
+      return nullptr; // block argument: base not statically known
+    if (mlir::isa<cir::AllocaOp, cir::GetGlobalOp>(def))
+      return def;
+    if (auto stride = mlir::dyn_cast<cir::PtrStrideOp>(def)) {
+      v = stride.getBase();
+      continue;
+    }
+    if (auto ge = mlir::dyn_cast<cir::GetElementOp>(def)) {
+      v = ge.getBase();
+      continue;
+    }
+    if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(def)) {
+      v = gm.getAddr();
+      continue;
+    }
+    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
+      // Only pointer-preserving re-bases keep provenance; an int_to_ptr breaks
+      // the chain (the integer could denote any object), so bail out there.
+      if (cast.getKind() == cir::CastKind::int_to_ptr)
+        return nullptr;
+      v = cast.getSrc();
+      continue;
+    }
+    return nullptr; // unknown pointer producer: cannot resolve base
+  }
+  return nullptr;
+}
+
+// Two resolved base objects denote the same allocation iff they are the same
+// `cir.alloca`, or two `cir.get_global`s naming the same symbol.
+static bool sameCIRBaseObject(mlir::Operation *a, mlir::Operation *b) {
+  if (a == b)
+    return true;
+  auto ga = mlir::dyn_cast<cir::GetGlobalOp>(a);
+  auto gb = mlir::dyn_cast<cir::GetGlobalOp>(b);
+  if (ga && gb)
+    return ga.getName() == gb.getName();
+  return false;
+}
+
+// True when the two pointers provably originate from distinct allocations.
+// Conservative: only returns true when BOTH bases resolve statically and are
+// different objects; an unresolvable base yields false (no reject).
+static bool provablyCrossAllocation(mlir::Value lhs, mlir::Value rhs) {
+  mlir::Operation *baseL = traceCIRPointerBase(lhs);
+  mlir::Operation *baseR = traceCIRPointerBase(rhs);
+  return baseL && baseR && !sameCIRBaseObject(baseL, baseR);
+}
+
+// Strip pointer-preserving casts to reach the underlying address producer,
+// used to classify the branches of a conditional pointer-to-field select.
+static mlir::Operation *stripCIRPointerCasts(mlir::Value v) {
+  while (v) {
+    auto cast = v.getDefiningOp<cir::CastOp>();
+    if (!cast || cast.getKind() == cir::CastKind::int_to_ptr)
+      break;
+    v = cast.getSrc();
+  }
+  return v ? v.getDefiningOp() : nullptr;
+}
+
 void ConvertCIRToMLIRPass::runOnOperation() {
   mlir::ModuleOp theModule = getOperation();
 
@@ -2907,6 +3015,176 @@ void ConvertCIRToMLIRPass::runOnOperation() {
       }
     });
     if (badReturn) {
+      signalPassFailure();
+      return;
+    }
+  }
+
+  // Up-front pointer-legality checks. These reject — with a single named
+  // diagnostic — pointer shapes that have no sound memref lowering, rather than
+  // letting them fall through the dialect conversion and surface as an opaque
+  // "failed to legalize unresolved materialization" error. They are phrased as
+  // early, principled legality checks (a module walk) instead of scattered
+  // per-pattern special cases, and all share the one `traceCIRPointerBase`
+  // provenance helper.
+  {
+    bool illegal = false;
+    auto reject = [&](mlir::Operation *op, const llvm::Twine &msg) {
+      op->emitError(msg);
+      illegal = true;
+    };
+
+    theModule.walk([&](mlir::Operation *op) {
+      // (e) Indirect calls / function pointers have no hardware realization and
+      // otherwise leak an unresolved '!cir.int' materialization because the
+      // func-pointer callee operand is unconvertible and the indirect-call
+      // pattern is never even reached.
+      if (auto call = mlir::dyn_cast<cir::CallOp>(op)) {
+        if (!call.isIndirect())
+          return;
+        // A no-prototype / K&R direct call is emitted by ClangIR as an indirect
+        // call whose callee is a `cir.get_global` of a function symbol that is
+        // used ONLY as a call callee; CIRGetGlobalOpLowering folds that to a
+        // direct `func.call`. Do not reject that foldable shape here — only a
+        // GENUINE runtime function pointer (callee from a load / argument /
+        // stored value, or a func-global whose address otherwise escapes).
+        bool foldableDirectCall = false;
+        if (auto gg =
+                call.getIndirectCall().getDefiningOp<cir::GetGlobalOp>()) {
+          if (mlir::isa<cir::FuncType>(gg.getType().getPointee()))
+            foldableDirectCall = llvm::all_of(gg->getUses(), [](auto &use) {
+              auto c = mlir::dyn_cast<cir::CallOp>(use.getOwner());
+              return c && c.isIndirect() && use.getOperandNumber() == 0;
+            });
+        }
+        if (!foldableDirectCall)
+          reject(op, "ThroughMLIR: indirect call / function pointer is not "
+                     "supported yet; there is no hardware realization for a "
+                     "runtime function pointer");
+        return;
+      }
+
+      // (a) Pointer difference across distinct allocations is not physically
+      // meaningful after synthesis (distinct memories) and currently leaks a
+      // '!cir.int' materialization. Same-root / unresolvable diffs are left to
+      // downstream handling.
+      if (auto diff = mlir::dyn_cast<cir::PtrDiffOp>(op)) {
+        if (provablyCrossAllocation(diff.getLhs(), diff.getRhs()))
+          reject(op, "ThroughMLIR: pointer difference across distinct "
+                     "allocations is not supported yet; subtracting pointers "
+                     "into different objects has no defined element distance "
+                     "in hardware");
+        return;
+      }
+
+      // (d) Cross-allocation RELATIONAL pointer comparisons (<, <=, >, >=) are
+      // not physically meaningful across distinct memories. Only the cross-alloc
+      // arm is rejected here; same-allocation and statically-unresolvable
+      // compares keep their existing (correct) lowering in CIRCmpOpLowering.
+      if (auto cmp = mlir::dyn_cast<cir::CmpOp>(op)) {
+        if (!mlir::isa<cir::PointerType>(cmp.getLhs().getType()))
+          return;
+        auto kind = cmp.getKind();
+        bool relational =
+            kind == cir::CmpOpKind::lt || kind == cir::CmpOpKind::le ||
+            kind == cir::CmpOpKind::gt || kind == cir::CmpOpKind::ge;
+        if (relational && provablyCrossAllocation(cmp.getLhs(), cmp.getRhs()))
+          reject(op, "ThroughMLIR: relational comparison (<, <=, >, >=) of "
+                     "pointers into distinct allocations is not supported yet; "
+                     "cross-object pointer ordering is undefined in hardware");
+        return;
+      }
+
+      // (c) Conditional pointer-to-field: a select whose two pointer branches
+      // are addresses of record members (`cir.get_member`). The two field
+      // addresses cannot be unified into a single memref index, so this leaks a
+      // ptr->memref materialization error today.
+      if (auto sel = mlir::dyn_cast<cir::SelectOp>(op)) {
+        if (!mlir::isa<cir::PointerType>(sel.getResult().getType()))
+          return;
+        auto *t = stripCIRPointerCasts(sel.getTrueValue());
+        auto *f = stripCIRPointerCasts(sel.getFalseValue());
+        if ((t && mlir::isa<cir::GetMemberOp>(t)) ||
+            (f && mlir::isa<cir::GetMemberOp>(f)))
+          reject(op, "ThroughMLIR: conditional pointer-to-field (select with a "
+                     "record-member-address branch) is not supported yet; a "
+                     "runtime choice involving a field address has no single "
+                     "memref index");
+        return;
+      }
+
+      // (b) Partial N-D get_element chains whose intermediate ROW pointer (a
+      // pointer still pointing at an array, not a scalar element) escapes by
+      // being passed to a call or stored — this leaks a ptr->memref
+      // materialization error. A row pointer that is only further indexed
+      // (fed into another get_element) is fine and is not rejected.
+      if (auto ge = mlir::dyn_cast<cir::GetElementOp>(op)) {
+        auto resPtr = mlir::cast<cir::PointerType>(ge.getResult().getType());
+        if (!mlir::isa<cir::ArrayType>(resPtr.getPointee()))
+          return; // fully-indexed scalar element pointer — fine
+        // Follow the row pointer forward through row-preserving derivations:
+        // pointer-preserving casts (`array_to_ptrdecay` / `bitcast`) and any
+        // `ptr_stride` / `get_element` whose RESULT still points at an array
+        // (i.e. is still a row pointer — `rp += 1`, `&m[i]` re-bases). The same
+        // physical row address (or a sibling row of the same base) is reached,
+        // so escape must be re-checked at the derived pointer. An ESCAPE is the
+        // pointer being stored into memory (as the stored value) or passed to a
+        // call — it leaves the analyzable use set as a first-class pointer. A
+        // FULLY-indexed derivation (a get_element whose result is a scalar
+        // element pointer) is NOT followed and is not an escape: it is
+        // chain-collapsed into a multi-index access at the use site.
+        auto isRowPointer = [](mlir::Type ty) {
+          auto pt = mlir::dyn_cast<cir::PointerType>(ty);
+          return pt && mlir::isa<cir::ArrayType>(pt.getPointee());
+        };
+        llvm::SmallVector<mlir::Value, 4> worklist{ge.getResult()};
+        llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+        bool escapes = false;
+        while (!worklist.empty() && !escapes) {
+          mlir::Value cur = worklist.pop_back_val();
+          for (mlir::Operation *user : cur.getUsers()) {
+            if (mlir::isa<cir::CallOp>(user)) {
+              escapes = true;
+              break;
+            }
+            if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
+              if (st.getValue() == cur) {
+                escapes = true;
+                break;
+              }
+              continue;
+            }
+            if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
+              if ((cast.getKind() == cir::CastKind::array_to_ptrdecay ||
+                   cast.getKind() == cir::CastKind::bitcast) &&
+                  visited.insert(cast).second)
+                worklist.push_back(cast.getResult());
+              continue;
+            }
+            if (auto stride = mlir::dyn_cast<cir::PtrStrideOp>(user)) {
+              if (isRowPointer(stride.getResult().getType()) &&
+                  visited.insert(stride).second)
+                worklist.push_back(stride.getResult());
+              continue;
+            }
+            if (auto inner = mlir::dyn_cast<cir::GetElementOp>(user)) {
+              if (isRowPointer(inner.getResult().getType()) &&
+                  visited.insert(inner).second)
+                worklist.push_back(inner.getResult());
+              continue;
+            }
+          }
+        }
+        if (escapes)
+          reject(op, "ThroughMLIR: an intermediate row pointer of a "
+                     "multi-dimensional array (partial get_element chain) that "
+                     "escapes via a call or store is not supported yet; index "
+                     "the row fully at its use site instead");
+        return;
+      }
+    });
+
+    if (illegal) {
       signalPassFailure();
       return;
     }
@@ -2958,6 +3236,28 @@ void ConvertCIRToMLIRPass::runOnOperation() {
                                                 std::move(patterns)))) {
     signalPassFailure();
     return;
+  }
+
+  // Escalate global-lowering rejects to a hard pass failure. The `cir` dialect
+  // is intentionally not marked illegal (WhileOp lowering relies on preserving
+  // e.g. `cir.continue`), so a `cir.global` whose initializer we cannot lower
+  // (const-record / const-array / complex — each of which already emits a named
+  // diagnostic from CIRGlobalOpLowering) is simply LEFT unconverted by the
+  // partial conversion. When that global is dead (no consumer) the pass would
+  // otherwise exit 0 despite the emitted error. Any surviving `cir.global` is,
+  // by construction, one of those unsupported-initializer rejects (a supported
+  // global is always replaced by a memref.global), so escalate to a pass
+  // failure. We do NOT emit a second diagnostic here — the named message was
+  // already produced by the pattern — so `-verify-diagnostics` fixtures still
+  // see exactly one (matched) error while the process exit code becomes
+  // nonzero.
+  {
+    bool leftoverGlobal = false;
+    theModule.walk([&](cir::GlobalOp g) { leftoverGlobal = true; });
+    if (leftoverGlobal) {
+      signalPassFailure();
+      return;
+    }
   }
 
   // The conversion intentionally leaves dead IR rather than have a pattern

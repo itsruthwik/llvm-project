@@ -1,0 +1,26 @@
+// Adversarial variant of the row-pointer-escape reject: the intermediate row
+// pointer of a 2-D array (`int (*rp)[4] = &m[i]`) is RE-BASED by a row-typed
+// `cir.ptr_stride` (`rp += 1` — the result still points at an array) BEFORE
+// escaping to a call. The escape walk must follow row-preserving derivations
+// (ptr_stride / get_element with an array-pointee result), not only casts, or
+// this shape slips through and leaks the opaque "failed to legalize unresolved
+// materialization ... memref<4xi32>" error the check exists to prevent.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!row = !cir.ptr<!cir.array<!s32i x 4>>
+module {
+  cir.func private @sink(!row)
+  cir.func @k(%i: !s64i) {
+    %m = cir.alloca "m" align(16) : !cir.ptr<!cir.array<!cir.array<!s32i x 4> x 8>>
+    %r = cir.get_element %m[%i : !s64i] : !cir.ptr<!cir.array<!cir.array<!s32i x 4> x 8>> -> !cir.ptr<!cir.array<!s32i x 4>>
+    %c1 = cir.const #cir.int<1> : !s64i
+    %r2 = cir.ptr_stride %r, %c1 : (!row, !s64i) -> !row
+    cir.call @sink(%r2) : (!row) -> ()
+    cir.return
+  }
+}
+
+// CHECK: intermediate row pointer of a multi-dimensional array
