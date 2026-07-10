@@ -19,6 +19,7 @@ add_clang_library(MLIRCIRTransforms
   FlattenScopeGoto.cpp
   LowerUnionPunning.cpp
   LowerStructLocals.cpp
+  LowerPointerCursors.cpp
   ScrubIO.cpp
 
   DEPENDS

@@ -1,0 +1,60 @@
+// A stored pointer-cursor loop (`while (p < end) { ...; p++; }`) is rewritten
+// by --cir-lower-pointer-cursors into (base, index) form: the fat-pointer
+// slots become integer index slots, dereferences become get_element on the
+// root array, the increment becomes signed index arithmetic, and the
+// same-root pointer compare becomes an integer index compare. This removes
+// the stored-cursor offset-dropping class (P0) before --cir-to-mlir.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f() -> !s32i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 8>>
+    %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %e = cir.alloca "end" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    cir.store align(8) %d, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %d2 = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    %n = cir.const #cir.int<8> : !s32i
+    %pe = cir.ptr_stride %d2, %n : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    cir.store align(8) %pe, %e : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %z = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %z, %s : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      cir.while {
+        %0 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %1 = cir.load align(8) %e : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %2 = cir.cmp lt %0, %1 : !cir.ptr<!s32i>
+        cir.condition(%2)
+      } do {
+        %0 = cir.load deref align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %1 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+        %2 = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+        %3 = cir.add %2, %1 : !s32i
+        cir.store align(4) %3, %s : !s32i, !cir.ptr<!s32i>
+        %4 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %5 = cir.const #cir.int<1> : !s32i
+        %6 = cir.ptr_stride %4, %5 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+        cir.store align(8) %6, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+        cir.yield
+      }
+    }
+    %r = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// The fat-pointer slots are gone; index slots are plain int allocas.
+// CHECK-NOT: !cir.ptr<!cir.ptr<!s32i>>
+// CHECK: cir.func @f()
+// CHECK: %[[A:.+]] = cir.alloca "a"
+// CHECK: cir.alloca "p" {{.*}} : !cir.ptr<!s32i>
+// CHECK: cir.alloca "end" {{.*}} : !cir.ptr<!s32i>
+// The compare is an integer index compare, not a pointer compare.
+// CHECK: cir.cmp lt %{{.+}}, %{{.+}} : !s32i
+// The dereference is a rooted element access.
+// CHECK: cir.get_element %[[A]][{{.*}}] : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+// The increment is index arithmetic.
+// CHECK: cir.add %{{.+}}, %{{.+}} : !s32i

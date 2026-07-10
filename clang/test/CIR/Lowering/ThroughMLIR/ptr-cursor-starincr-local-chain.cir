@@ -1,0 +1,34 @@
+// A fully-promoted `*p++` sequence on a LOCAL array (an SSA ptr_stride CHAIN,
+// no slot survives mem2reg) is collapsed to rooted get_element accesses with
+// accumulated indices; the dead chain tail is erased. This shape previously
+// crashed cir-opt (P1 eraseIfSafe) and could only reach the untranslatable
+// ptr-dialect fallback.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @filter() -> !s32i {
+    %0 = cir.alloca "tqmf" align(16) : !cir.ptr<!cir.array<!s32i x 6>>
+    %2 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s32i x 6>> -> !cir.ptr<!s32i>
+    %4 = cir.const #cir.int<1> : !s32i
+    %5 = cir.ptr_stride %2, %4 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    %6 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    %8 = cir.const #cir.int<1> : !s32i
+    %9 = cir.ptr_stride %5, %8 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    %10 = cir.load align(4) %5 : !cir.ptr<!s32i>, !s32i
+    %11 = cir.add %6, %10 : !s32i
+    %12 = cir.const #cir.int<1> : !s32i
+    %13 = cir.ptr_stride %9, %12 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    %14 = cir.load align(4) %9 : !cir.ptr<!s32i>, !s32i
+    %15 = cir.add %11, %14 : !s32i
+    cir.return %15 : !s32i
+  }
+}
+
+// The chained strides are collapsed into rooted element accesses; the dead
+// trailing `p++` is erased entirely.
+// CHECK: %[[A:.+]] = cir.alloca "tqmf"
+// CHECK: cir.get_element %[[A]][{{.*}}] : !cir.ptr<!cir.array<!s32i x 6>> -> !cir.ptr<!s32i>
+// CHECK: cir.get_element %[[A]][{{.*}}] : !cir.ptr<!cir.array<!s32i x 6>> -> !cir.ptr<!s32i>
+// CHECK-NOT: cir.ptr_stride

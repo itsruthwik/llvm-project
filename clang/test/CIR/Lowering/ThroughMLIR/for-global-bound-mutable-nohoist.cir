@@ -1,0 +1,64 @@
+// A loop whose bound is a GLOBAL that is WRITTEN inside the loop body must
+// NOT have its bound load hoisted (the write check is SYMBOL-based: the body
+// re-materializes the global address with its own cir.get_global, so an
+// SSA-equality store walk would miss `N = 2` and freeze the bound — the gb2
+// probe then counts 5 instead of 3). The loop takes the general while path
+// and re-reads the bound every iteration.
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.global external @N = #cir.int<5> : !s32i
+  cir.func @compute() -> !s32i {
+    %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+    %z = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %z, %s : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %i = cir.alloca "i" align(4) : !cir.ptr<!s32i>
+      %c0 = cir.const #cir.int<0> : !s32i
+      cir.store align(4) %c0, %i : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+        %1 = cir.get_global @N : !cir.ptr<!s32i>
+        %2 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+        %3 = cir.cmp lt %0, %2 : !s32i
+        cir.condition(%3)
+      } body {
+        %0 = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+        %1 = cir.const #cir.int<1> : !s32i
+        %2 = cir.add %0, %1 : !s32i
+        cir.store align(4) %2, %s : !s32i, !cir.ptr<!s32i>
+        %3 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+        %4 = cir.const #cir.int<2> : !s32i
+        %5 = cir.cmp eq %3, %4 : !s32i
+        cir.if %5 {
+          %6 = cir.const #cir.int<2> : !s32i
+          %7 = cir.get_global @N : !cir.ptr<!s32i>
+          cir.store align(4) %6, %7 : !s32i, !cir.ptr<!s32i>
+        }
+        cir.yield
+      } step {
+        %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+        %1 = cir.const #cir.int<1> : !s32i
+        %2 = cir.add %0, %1 : !s32i
+        cir.store align(4) %2, %i : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %r = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// The bound-load hoist must NOT fire: no scf.for. The loop lowers to an
+// scf.while whose BEFORE region RE-READS the global bound on every
+// iteration (the pure get_global address itself may be hoisted; the LOAD
+// through it must stay inside the condition region).
+// CHECK: func.func @compute
+// CHECK-NOT: scf.for
+// CHECK: %[[G:.+]] = memref.get_global @N
+// CHECK: scf.while
+// CHECK: memref.load %[[G]][
+// CHECK: arith.cmpi
+// CHECK: scf.condition

@@ -1,0 +1,54 @@
+// A for loop whose induction-variable SLOT is read AFTER the loop must not
+// take the canonical scf.for path: that lowering discards the IV alloca's
+// per-iteration stores, so a post-loop read would see a STALE value (the
+// CHStone aes encrypt `AddRoundKey(statemt, type, i)` silent-wrong-code
+// class; also `for(i=0;i<5;i++); return s+i;` returning s+0). The loop
+// lowers through the general while path, which keeps the slot live.
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @f() -> !s32i {
+    %i = cir.alloca "i" align(4) : !cir.ptr<!s32i>
+    %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+    %z = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %z, %s : !s32i, !cir.ptr<!s32i>
+    %c0 = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %c0, %i : !s32i, !cir.ptr<!s32i>
+    cir.for : cond {
+      %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+      %1 = cir.const #cir.int<5> : !s32i
+      %2 = cir.cmp lt %0, %1 : !s32i
+      cir.condition(%2)
+    } body {
+      %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+      %1 = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+      %2 = cir.add %1, %0 : !s32i
+      cir.store align(4) %2, %s : !s32i, !cir.ptr<!s32i>
+      cir.yield
+    } step {
+      %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+      %1 = cir.const #cir.int<1> : !s32i
+      %2 = cir.add %0, %1 : !s32i
+      cir.store align(4) %2, %i : !s32i, !cir.ptr<!s32i>
+      cir.yield
+    }
+    %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+    %1 = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+    %2 = cir.add %1, %0 : !s32i
+    cir.return %2 : !s32i
+  }
+}
+
+// Post-loop IV read forces the while path; the IV slot stays live and is
+// re-read after the loop for the return value.
+// CHECK: func.func @f
+// CHECK-NOT: scf.for
+// CHECK: scf.while
+// CHECK: scf.yield
+// CHECK: }
+// CHECK: memref.load
+// CHECK: memref.load
+// CHECK: arith.addi
+// CHECK: return

@@ -1,0 +1,46 @@
+// A DECREMENTING cursor (`p--`, negative stride) with a `!=` bound compare is
+// rewritten to signed index arithmetic and an integer `ne` compare.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @g() -> !s32i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 8>>
+    %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    %n = cir.const #cir.int<7> : !s32i
+    %pl = cir.ptr_stride %d, %n : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    cir.store align(8) %pl, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    cir.scope {
+      cir.while {
+        %0 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %1 = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+        %2 = cir.cmp ne %0, %1 : !cir.ptr<!s32i>
+        cir.condition(%2)
+      } do {
+        %0 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %1 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+        %2 = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+        %3 = cir.add %2, %1 : !s32i
+        cir.store align(4) %3, %s : !s32i, !cir.ptr<!s32i>
+        %4 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+        %5 = cir.const #cir.int<-1> : !s32i
+        %6 = cir.ptr_stride %4, %5 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+        cir.store align(8) %6, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+        cir.yield
+      }
+    }
+    %r = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// CHECK-NOT: !cir.ptr<!cir.ptr<!s32i>>
+// CHECK: cir.const #cir.int<7>
+// The `ne` bound compare is an integer index compare against index 0.
+// CHECK: cir.cmp ne %{{.+}}, %{{.+}} : !s32i
+// The negative stride becomes a signed index add of -1.
+// CHECK: cir.const #cir.int<-1> : !s32i
+// CHECK: cir.add %{{.+}}, %{{.+}} : !s32i

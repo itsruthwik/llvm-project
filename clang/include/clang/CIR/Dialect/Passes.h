@@ -37,6 +37,7 @@ std::unique_ptr<Pass> createLowerReturnPass();
 std::unique_ptr<Pass> createFlattenScopeGotoPass();
 std::unique_ptr<Pass> createLowerUnionPunningPass();
 std::unique_ptr<Pass> createLowerStructLocalsPass();
+std::unique_ptr<Pass> createLowerPointerCursorsPass();
 std::unique_ptr<Pass> createScrubIOPass();
 std::unique_ptr<Pass> createIdiomRecognizerPass();
 std::unique_ptr<Pass> createIdiomRecognizerPass(clang::ASTContext *astCtx);

@@ -407,14 +407,40 @@ static bool collapseGetElementChain(mlir::Value addr, mlir::Value &base,
   return true;
 }
 
+// The element offset a memref.reinterpret_cast forwards, from its OWN
+// static_offsets attribute / dynamic operand list: a dynamic offset yields
+// the SSA operand, a static offset the attribute. Deliberately NOT
+// getConstifiedMixedOffset(): that helper consults the RESULT TYPE's layout,
+// and the identity-layout result these lowerings produce (e.g. memref<?xi32>,
+// static offset 0) would "constify" a genuinely DYNAMIC offset to 0 —
+// exactly the dropped-index bug this file must avoid.
+static mlir::OpFoldResult
+reinterpretForwardedOffset(mlir::memref::ReinterpretCastOp op) {
+  return op.getMixedOffsets()[0];
+}
+
 static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
                                SmallVector<mlir::Value> &indices,
                                SmallVector<mlir::Operation *> &eraseList,
                                mlir::ConversionPatternRewriter &rewriter) {
   addr = lookThroughMemrefMaterialization(addr);
-  while (mlir::Operation *addrOp =
-             addr.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
-    indices.push_back(addrOp->getOperand(1));
+  while (auto addrOp = addr.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
+    // Recover the forwarded element offset from the reinterpret_cast. The
+    // offset may be DYNAMIC (an SSA operand) or STATIC (an attribute, e.g.
+    // the identity offset 0 of an array_to_ptrdecay lowering, or a constant
+    // stride). Naively reading getOperand(1) here picked whatever operand
+    // came after the source — for a static-offset cast with a dynamic size
+    // that is the SIZE operand (the array extent!), turning a load through a
+    // plain decayed pointer into an out-of-bounds access at [size].
+    mlir::OpFoldResult offset = reinterpretForwardedOffset(addrOp);
+    if (auto offVal = llvm::dyn_cast<mlir::Value>(offset)) {
+      indices.push_back(offVal);
+    } else {
+      auto offAttr = mlir::cast<mlir::IntegerAttr>(
+          llvm::cast<mlir::Attribute>(offset));
+      indices.push_back(mlir::arith::ConstantIndexOp::create(
+          rewriter, addrOp.getLoc(), offAttr.getInt()));
+    }
     addr = lookThroughMemrefMaterialization(addrOp->getOperand(0));
     eraseList.push_back(addrOp);
   }
@@ -448,13 +474,12 @@ static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
 // Return true if the (index-typed) load/store index `indexVal` refers to the
 // same offset the reinterpret_cast forwards. The reinterpret_cast offset may be
 // STATIC (an integer attribute, so getOffsets() — which returns only the
-// *dynamic* offset operands — is empty) or DYNAMIC (an SSA operand). Using
-// getMixedOffsets()/getConstifiedMixedOffset() handles both uniformly:
+// *dynamic* offset operands — is empty) or DYNAMIC (an SSA operand):
 //  - dynamic offset  → compare SSA values;
 //  - static offset   → compare against the constant the index materializes to.
 static bool indexMatchesReinterpretOffset(mlir::Value indexVal,
                                           mlir::memref::ReinterpretCastOp op) {
-  mlir::OpFoldResult offset = op.getConstifiedMixedOffset();
+  mlir::OpFoldResult offset = reinterpretForwardedOffset(op);
   if (auto offVal = llvm::dyn_cast<mlir::Value>(offset))
     return indexVal == offVal;
   // Static offset: match iff the index is a constant with the same value.
@@ -510,8 +535,28 @@ static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
     }
   }
   // If all load/store ops are using forwarded offsets from the current
-  // memref.(reinterpret_)cast ops, erase them
+  // memref.(reinterpret_)cast ops, erase them — but ONLY when every live
+  // user of each candidate is accounted for: another candidate in the same
+  // list, a still-unconverted `cir.*` op (pending replacement by the
+  // conversion driver), or a rewired memref.load/store. Any other consumer
+  // (a compare's extract_strided_metadata, a ptr-dialect offset chain, a
+  // memref.dim from a chained view, ...) keeps the op alive; erasing it
+  // would fire the deferred-erase "expected that op has no uses" assertion
+  // at applyRewrites. Leaving it is safe: it is a legal, side-effect-free
+  // memref op.
   if (oldUsedNum == newUsedNum) {
+    llvm::SmallPtrSet<mlir::Operation *, 4> listSet(eraseList.begin(),
+                                                    eraseList.end());
+    for (auto *op : eraseList)
+      for (auto *user : op->getUsers()) {
+        if (listSet.contains(user))
+          continue;
+        if (user->getName().getDialectNamespace() == "cir")
+          continue;
+        if (mlir::isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(user))
+          continue;
+        return; // unaccounted consumer: keep the views alive.
+      }
     for (auto op : eraseList)
       rewriter.eraseOp(op);
   }
@@ -1251,8 +1296,32 @@ public:
       return mlir::LogicalResult::success();
     }
 
-    // For scopes without results, use memref.alloca_scope
+    // For scopes without results, use memref.alloca_scope — but ONLY when the
+    // scope actually contains an allocation to bound: `memref.alloca_scope`
+    // exists solely to delimit stack lifetime, and its LLVM lowering splits
+    // the surrounding block (stacksave/stackrestore), which is ILLEGAL inside
+    // a single-block region such as an `scf.while` body (e.g. CHStone adpcm's
+    // per-iteration scope). An allocation-free scope is pure control grouping
+    // with nothing to bound, so inline its single block directly instead.
     if (scopeOp.getNumResults() == 0) {
+      bool hasAlloca =
+          scopeOp.getScopeRegion()
+              .walk([](cir::AllocaOp) {
+                return mlir::WalkResult::interrupt();
+              })
+              .wasInterrupted();
+      if (!hasAlloca && scopeRegion.hasOneBlock()) {
+        mlir::Block *block = &scopeRegion.front();
+        // The single block ends in cir.yield (checked non-empty above).
+        mlir::Operation *terminator = block->getTerminator();
+        if (mlir::isa<cir::YieldOp>(terminator)) {
+          rewriter.eraseOp(terminator);
+          rewriter.inlineBlockBefore(block, scopeOp.getOperation(),
+                                     mlir::ValueRange{});
+          rewriter.eraseOp(scopeOp);
+          return mlir::success();
+        }
+      }
       auto allocaScope = mlir::memref::AllocaScopeOp::create(
           rewriter, scopeOp.getLoc(), mlir::TypeRange{});
       rewriter.inlineRegionBefore(scopeOp.getScopeRegion(),
@@ -2299,15 +2368,139 @@ public:
   }
 };
 
+// Shared ptr-dialect fallback for an address computation `base + stride`
+// whose RESULT VALUE escapes the local load/store neighbourhood (stored as a
+// value, passed to a call, compared, chained through another address op).
+// The identity-layout memref.reinterpret_cast the load/store path uses cannot
+// carry the offset for such consumers (an identity layout drops it — the
+// silently-wrong stored/passed pointer class), so the offset is applied to
+// the RAW pointer instead: to_ptr → ptr_add(byte offset) → from_ptr, giving
+// a memref whose descriptor pointer is genuinely shifted. Composes correctly
+// under chaining (each link shifts the raw pointer again).
+// Peel identity re-views (offset-0 reinterpret_casts, plain memref.casts,
+// materializations) off a converted pointer base down to the storage op.
+// Consumers that keep the raw base value alive (the ptr-dialect offset path)
+// MUST use the peeled base: the intermediate reinterpret_casts are owned by
+// eraseIfSafe, which erases them once all load/store consumers are rewired
+// and cannot see other uses. Returns a null Value when the base is an
+// offset-CARRYING view that cannot be peeled soundly (to_ptr on it would
+// silently drop the offset) — callers must then fail loudly.
+static mlir::Value peelIdentityMemrefViews(mlir::Value base) {
+  while (true) {
+    base = lookThroughMemrefMaterialization(base);
+    if (auto ri = base.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
+      mlir::OpFoldResult off = reinterpretForwardedOffset(ri);
+      auto attr = llvm::dyn_cast<mlir::Attribute>(off);
+      if (attr && mlir::cast<mlir::IntegerAttr>(attr).getInt() == 0) {
+        base = ri->getOperand(0);
+        continue;
+      }
+      return mlir::Value(); // offset-carrying view: not peelable.
+    }
+    if (auto mc = base.getDefiningOp<mlir::memref::CastOp>()) {
+      base = mc->getOperand(0);
+      continue;
+    }
+    return base;
+  }
+}
+
+static mlir::Value emitPtrDialectOffset(mlir::Operation *op, mlir::Value base,
+                                        mlir::Value stride,
+                                        cir::PointerType resultPtrTy,
+                                        const mlir::TypeConverter *converter,
+                                        mlir::ConversionPatternRewriter &rw) {
+  base = peelIdentityMemrefViews(base);
+  if (!base || !mlir::isa<mlir::MemRefType>(base.getType()))
+    return mlir::Value();
+  // Element count scaling for pointers-to-arrays (row pointers).
+  int mulSize = 1;
+  mlir::Type innerMostPointee = resultPtrTy.getPointee();
+  while (auto t1 = mlir::dyn_cast<cir::ArrayType>(innerMostPointee)) {
+    mulSize *= t1.getSize();
+    innerMostPointee = t1.getElementType();
+  }
+  auto elementType = converter->convertType(innerMostPointee);
+
+  auto ptrPtrType = mlir::ptr::PtrType::get(
+      rw.getContext(), mlir::ptr::GenericSpaceAttr::get(op->getContext()));
+
+  mlir::Value elemSizeVal = mlir::ptr::TypeOffsetOp::create(
+      rw, op->getLoc(), rw.getIndexType(), elementType);
+
+  mlir::Value strideIndex = stride;
+  if (strideIndex.getType() != rw.getIndexType())
+    strideIndex = mlir::arith::IndexCastOp::create(rw, op->getLoc(),
+                                                   rw.getIndexType(), stride);
+
+  mlir::Value offset = mlir::arith::MulIOp::create(rw, op->getLoc(),
+                                                   strideIndex, elemSizeVal);
+  if (mulSize > 1) {
+    mlir::Value mulSizeConst =
+        mlir::arith::ConstantIndexOp::create(rw, op->getLoc(), mulSize);
+    offset =
+        mlir::arith::MulIOp::create(rw, op->getLoc(), offset, mulSizeConst);
+  }
+
+  auto t1 = mlir::cast<mlir::MemRefType>(base.getType());
+  auto t2 = mlir::MemRefType::get(t1.getShape(), t1.getElementType(),
+                                  t1.getLayout(), ptrPtrType.getMemorySpace());
+  auto ptrMetaType = mlir::ptr::PtrMetadataType::get(t2);
+
+  auto fixedBase =
+      mlir::memref::MemorySpaceCastOp::create(rw, op->getLoc(), t2, base);
+  auto getMetadataOp =
+      mlir::ptr::GetMetadataOp::create(rw, op->getLoc(), ptrMetaType,
+                                       fixedBase);
+  auto toPtrOp =
+      mlir::ptr::ToPtrOp::create(rw, op->getLoc(), ptrPtrType, fixedBase);
+  auto ptrAddOp = mlir::ptr::PtrAddOp::create(rw, op->getLoc(), ptrPtrType,
+                                              toPtrOp, offset);
+  auto fromPtrOp = mlir::ptr::FromPtrOp::create(rw, op->getLoc(), t2, ptrAddOp,
+                                                getMetadataOp);
+  mlir::Value res = mlir::memref::MemorySpaceCastOp::create(rw, op->getLoc(),
+                                                            t1, fromPtrOp);
+  // Peeling may have exposed a base whose memref type differs from the
+  // expected converted result type (e.g. a static-shaped alloca under a
+  // decayed view): re-view the shifted pointer as the converted result type
+  // with offset 0 (the shift already lives in the descriptor pointer).
+  auto dstType =
+      mlir::cast<mlir::MemRefType>(converter->convertType(resultPtrTy));
+  if (res.getType() != dstType) {
+    llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
+    if (mlir::failed(
+            prepareReinterpretMetadata(dstType, res, rw, sizes, strides, op)))
+      return mlir::Value();
+    res = mlir::memref::ReinterpretCastOp::create(
+        rw, op->getLoc(), dstType, res, /*offset=*/rw.getIndexAttr(0), sizes,
+        strides);
+  }
+  return res;
+}
+
 class CIRGetElementOpLowering
     : public mlir::OpConversionPattern<cir::GetElementOp> {
   using mlir::OpConversionPattern<cir::GetElementOp>::OpConversionPattern;
 
+  // True when every use of the get_element RESULT is a local address
+  // consumer: a load, a store THROUGH the pointer (the result is the store's
+  // address — a store OF the pointer value is an escape, the offset-dropping
+  // class), or a chained get_element. Anything else (call argument, stored
+  // as a value, compare, ptr_stride re-base, ...) is an escape and takes the
+  // ptr-dialect offset path instead of an identity-layout reinterpret_cast.
   bool isLoadStoreOrGetProducer(cir::GetElementOp op) const {
-    for (auto *user : op->getUsers()) {
+    if (op.use_empty())
+      return false;
+    for (auto &use : op->getUses()) {
+      mlir::Operation *user = use.getOwner();
       if (!op->isBeforeInBlock(user))
         return false;
-      if (isa<cir::LoadOp, cir::StoreOp, cir::GetElementOp>(*user))
+      if (auto storeUser = dyn_cast<cir::StoreOp>(user)) {
+        if (use.get() == storeUser.getValue())
+          return false;
+        continue;
+      }
+      if (isa<cir::LoadOp, cir::GetElementOp>(*user))
         continue;
       return false;
     }
@@ -2322,12 +2515,116 @@ class CIRGetElementOpLowering
   // MemRef Dialect doesn't have GEP-like operation. memref.reinterpret_cast
   // only been used to propagate %base and %index to memref.load/store and
   // should be erased after the conversion.
+  // Lower a get_element whose result ESCAPES (call argument, stored as a
+  // value, compare, ptr_stride re-base): ground the WHOLE original
+  // get_element/ptr_stride chain at its root, accumulate one raw byte
+  // offset, shift the root pointer through the ptr dialect, and re-view the
+  // shifted pointer as the result memref type with offset 0. Grounding at
+  // the root (instead of the converted base) matters because an inner chain
+  // link lowered for load/store consumers is an identity-layout
+  // reinterpret_cast whose offset `ptr.to_ptr` would silently drop.
+  mlir::LogicalResult
+  rewriteEscape(cir::GetElementOp op, OpAdaptor adaptor,
+                mlir::ConversionPatternRewriter &rewriter) const {
+    mlir::Location loc = op.getLoc();
+    // Walk the original chain down to the root.
+    llvm::SmallVector<std::pair<mlir::Value, cir::PointerType>, 4> links;
+    mlir::Value root = op.getResult();
+    while (true) {
+      if (auto ge = root.getDefiningOp<cir::GetElementOp>()) {
+        links.push_back({ge.getIndex(), ge.getType()});
+        root = ge.getBase();
+        continue;
+      }
+      if (auto ps = root.getDefiningOp<cir::PtrStrideOp>()) {
+        links.push_back({ps.getStride(), ps.getType()});
+        root = ps.getBase();
+        continue;
+      }
+      break;
+    }
+    mlir::Value base = rewriter.getRemappedValue(root);
+    if (!base || !mlir::isa<mlir::MemRefType>(base.getType()))
+      return mlir::failure();
+    // Peel identity re-views down to the storage op: intermediate
+    // reinterpret_casts are owned by eraseIfSafe, which cannot see this
+    // pattern's extra use of them.
+    base = peelIdentityMemrefViews(base);
+    if (!base || !mlir::isa<mlir::MemRefType>(base.getType()))
+      return mlir::failure();
+
+    // Accumulate the total byte offset over all links.
+    mlir::Value total;
+    for (auto &[cirIdx, linkTy] : links) {
+      mlir::Value idx = rewriter.getRemappedValue(cirIdx);
+      if (!idx)
+        return mlir::failure();
+      if (idx.getType() != rewriter.getIndexType())
+        idx = mlir::arith::IndexCastOp::create(rewriter, loc,
+                                               rewriter.getIndexType(), idx);
+      int mulSize = 1;
+      mlir::Type inner = linkTy.getPointee();
+      while (auto at = mlir::dyn_cast<cir::ArrayType>(inner)) {
+        mulSize *= at.getSize();
+        inner = at.getElementType();
+      }
+      mlir::Value elemSize = mlir::ptr::TypeOffsetOp::create(
+          rewriter, loc, rewriter.getIndexType(),
+          getTypeConverter()->convertType(inner));
+      mlir::Value term =
+          mlir::arith::MulIOp::create(rewriter, loc, idx, elemSize);
+      if (mulSize > 1)
+        term = mlir::arith::MulIOp::create(
+            rewriter, loc, term,
+            mlir::arith::ConstantIndexOp::create(rewriter, loc, mulSize));
+      total = total ? mlir::Value(mlir::arith::AddIOp::create(rewriter, loc,
+                                                              total, term))
+                    : term;
+    }
+
+    // Shift the root's raw pointer by the byte offset.
+    auto ptrPtrType = mlir::ptr::PtrType::get(
+        rewriter.getContext(),
+        mlir::ptr::GenericSpaceAttr::get(op->getContext()));
+    auto t1 = mlir::cast<mlir::MemRefType>(base.getType());
+    auto t2 =
+        mlir::MemRefType::get(t1.getShape(), t1.getElementType(),
+                              t1.getLayout(), ptrPtrType.getMemorySpace());
+    auto fixedBase =
+        mlir::memref::MemorySpaceCastOp::create(rewriter, loc, t2, base);
+    auto meta = mlir::ptr::GetMetadataOp::create(
+        rewriter, loc, mlir::ptr::PtrMetadataType::get(t2), fixedBase);
+    auto toPtr = mlir::ptr::ToPtrOp::create(rewriter, loc, ptrPtrType,
+                                            fixedBase);
+    auto shifted = mlir::ptr::PtrAddOp::create(rewriter, loc, ptrPtrType,
+                                               toPtr, total);
+    auto fromPtr =
+        mlir::ptr::FromPtrOp::create(rewriter, loc, t2, shifted, meta);
+    mlir::Value backCast =
+        mlir::memref::MemorySpaceCastOp::create(rewriter, loc, t1, fromPtr);
+
+    // Re-view the shifted pointer as the (rank-reduced) result memref type
+    // with offset 0: the shift already lives in the descriptor pointer.
+    auto dstType =
+        cast<mlir::MemRefType>(getTypeConverter()->convertType(op.getType()));
+    llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
+    if (mlir::failed(prepareReinterpretMetadata(dstType, backCast, rewriter,
+                                                sizes, strides,
+                                                op.getOperation())))
+      return mlir::failure();
+    rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
+        op, dstType, backCast, /*offset=*/rewriter.getIndexAttr(0), sizes,
+        strides);
+    return mlir::success();
+  }
+
   mlir::LogicalResult
   matchAndRewrite(cir::GetElementOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    // Only rewrite if all users are load/stores.
+    // A result that escapes the local load/store neighbourhood takes the
+    // root-grounded ptr-dialect path (offset applied to the raw pointer).
     if (!isLoadStoreOrGetProducer(op))
-      return mlir::failure();
+      return rewriteEscape(op, adaptor, rewriter);
 
     // Cast the index to the index type, if needed.
     auto index = adaptor.getIndex();
@@ -2397,10 +2694,26 @@ public:
   inline bool isLoadStoreOrCastArrayToPtrProduer(cir::PtrStrideOp op) const {
     if (op.use_empty())
       return false;
-    for (auto *user : op->getUsers()) {
+    for (auto &use : op->getUses()) {
+      mlir::Operation *user = use.getOwner();
       if (!op->isBeforeInBlock(user))
         return false;
-      if (isa<cir::LoadOp, cir::StoreOp, cir::GetElementOp>(*user))
+      // A store is a deref consumer ONLY when the ptr_stride result is the
+      // ADDRESS being stored through. A store OF the pointer (the result is
+      // the stored VALUE — a pointer-cursor reassignment such as `p = p + 1`)
+      // must NOT take the reinterpret_cast path: memref.reinterpret_cast
+      // offsets are relative to the underlying buffer, so treating the stored
+      // whole pointer as a deref consumer silently DROPS the accumulated
+      // offset (the root entry to the stored-cursor offset-dropping bug).
+      // Such a stored whole pointer falls through to the ptr-dialect path
+      // below, which preserves the offset arithmetic or fails loudly at
+      // translation — never a silent miscompile.
+      if (auto storeUser = dyn_cast<cir::StoreOp>(user)) {
+        if (use.get() == storeUser.getValue())
+          return false;
+        continue;
+      }
+      if (isa<cir::LoadOp, cir::GetElementOp>(*user))
         continue;
       auto castOp = dyn_cast<cir::CastOp>(*user);
       if (castOp && (castOp.getKind() == cir::CastKind::array_to_ptrdecay))
@@ -2487,69 +2800,12 @@ public:
                                              rewriter);
     }
 
-    auto base = adaptor.getBase();
-    auto stride = adaptor.getStride();
-
-    auto ptrType = op.getType();
-
-    int mulSize = 1;
-    auto innerMostPointee = ptrType.getPointee();
-    while (auto t1 = mlir::dyn_cast<cir::ArrayType>(innerMostPointee)) {
-      mulSize *= t1.getSize();
-      innerMostPointee = t1.getElementType();
-    }
-
-    auto elementType = convertTy(innerMostPointee);
-
-    auto ptrPtrType = mlir::ptr::PtrType::get(
-        rewriter.getContext(),
-        mlir::ptr::GenericSpaceAttr::get(op->getContext()));
-
-    mlir::Value elemSizeVal = mlir::ptr::TypeOffsetOp::create(
-        rewriter, op.getLoc(), rewriter.getIndexType(), elementType);
-
-    mlir::Value strideIndex = mlir::arith::IndexCastOp::create(
-        rewriter, op.getLoc(), rewriter.getIndexType(), stride);
-
-    mlir::Value offsetInnerMost = mlir::arith::MulIOp::create(
-        rewriter, op.getLoc(), strideIndex, elemSizeVal);
-
-    mlir::Value offset;
-    if (mulSize > 1) {
-      mlir::Value mulSizeConst =
-          mlir::arith::ConstantIndexOp::create(rewriter, op->getLoc(), mulSize);
-      offset = mlir::arith::MulIOp::create(rewriter, op.getLoc(),
-                                           offsetInnerMost, mulSizeConst);
-    } else {
-      offset = offsetInnerMost;
-    }
-
-    auto t1 = mlir::cast<mlir::MemRefType>(base.getType());
-    auto t2 =
-        mlir::MemRefType::get(t1.getShape(), t1.getElementType(),
-                              t1.getLayout(), ptrPtrType.getMemorySpace());
-
-    auto ptrMetaType = mlir::ptr::PtrMetadataType::get(t2);
-
-    auto fixedBase = mlir::memref::MemorySpaceCastOp::create(
-        rewriter, op->getLoc(), t2, base);
-
-    auto getMetadataOp = mlir::ptr::GetMetadataOp::create(
-        rewriter, op->getLoc(), ptrMetaType, fixedBase);
-
-    auto toPtrOp = mlir::ptr::ToPtrOp::create(rewriter, op->getLoc(),
-                                              ptrPtrType, fixedBase);
-
-    auto ptrAddOp = mlir::ptr::PtrAddOp::create(rewriter, op.getLoc(),
-                                                ptrPtrType, toPtrOp, offset);
-
-    auto fromPtrOp = mlir::ptr::FromPtrOp::create(rewriter, op.getLoc(), t2,
-                                                  ptrAddOp, getMetadataOp);
-
-    auto memrefCastOp = mlir::memref::MemorySpaceCastOp::create(
-        rewriter, op.getLoc(), t1, fromPtrOp);
-
-    rewriter.replaceOp(op, memrefCastOp);
+    mlir::Value repl =
+        emitPtrDialectOffset(op, adaptor.getBase(), adaptor.getStride(),
+                             op.getType(), getTypeConverter(), rewriter);
+    if (!repl)
+      return mlir::failure(); // unpeelable offset-carrying base: fail loudly.
+    rewriter.replaceOp(op, repl);
     return mlir::success();
   }
 };
@@ -2778,6 +3034,73 @@ static mlir::TypeConverter prepareTypeConverter() {
 //===----------------------------------------------------------------------===//
 namespace {
 
+// Whether anything inside `forOp` — a DIRECT in-loop access or any call
+// reachable from the loop — might WRITE the global `sym`. The direct check
+// must be SYMBOL-based, not SSA-based: the loop body re-materializes the
+// global address with its own `cir.get_global @sym` (a different SSA value
+// than the bound's), so an address-equality store walk misses `N = 2` inside
+// a `for (i = 0; i < N; i++)` and would freeze the bound (miscompile: the
+// gb2.c probe counts 5 instead of 3). Conservative on calls: an indirect
+// call, an unresolvable / declaration-only callee, or any non-load use of
+// the symbol's address in the loop or a reachable callee counts as a
+// potential write. Used to gate hoisting a global-backed loop bound out of
+// the condition region.
+static bool globalMayBeWrittenInLoop(cir::ForOp forOp, llvm::StringRef sym) {
+  auto module = forOp->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return true;
+  bool unsafe = false;
+  // ADDRESS-ESCAPE check, MODULE-WIDE: if any `cir.get_global @sym` anywhere
+  // in the module has a non-load user (stored as a value like
+  // `int *q = &N;`, pointer arithmetic, passed to a call, ...), the symbol's
+  // address has escaped and ANY in-loop store through ANY pointer may alias
+  // it (`*q = 2;` inside a `for (i = 0; i < N; i++)` — the gescape probe).
+  // This subsumes the in-loop and in-callee direct-use checks: a write to
+  // the symbol from anywhere requires a get_global of it somewhere, and a
+  // store's ADDRESS operand is itself a non-load use. Conservative, one
+  // module walk, cheap — the read-only-bound shape (all users are loads)
+  // stays hoistable.
+  module->walk([&](cir::GetGlobalOp gg) {
+    if (gg.getName() != sym)
+      return;
+    for (mlir::Operation *user : gg->getUsers())
+      if (!mlir::isa<cir::LoadOp>(user))
+        unsafe = true; // any non-read use anywhere: assume a write/alias.
+  });
+  if (unsafe)
+    return true;
+  // Calls that leave the module can still write the (external) symbol
+  // without an in-module get_global: an indirect call or a reachable
+  // body-less callee stays conservative.
+  llvm::SmallVector<llvm::StringRef, 8> work;
+  llvm::DenseSet<llvm::StringRef> seen;
+  auto visitCalls = [&](mlir::Operation *root) {
+    root->walk([&](cir::CallOp call) {
+      if (call.isIndirect()) {
+        unsafe = true;
+        return;
+      }
+      if (auto callee = call.getCallee()) {
+        if (seen.insert(*callee).second)
+          work.push_back(*callee);
+      } else {
+        unsafe = true;
+      }
+    });
+  };
+  visitCalls(forOp);
+  while (!unsafe && !work.empty()) {
+    llvm::StringRef name = work.pop_back_val();
+    auto fn = module.lookupSymbol<cir::FuncOp>(name);
+    if (!fn || fn.getBody().empty()) {
+      unsafe = true; // unknown or body-less callee: assume it may write.
+      break;
+    }
+    visitCalls(fn);
+  }
+  return unsafe;
+}
+
 static mlir::Value scfPrepFindIVAddr(mlir::Block *step) {
   mlir::Value ivAddr = nullptr;
   for (mlir::Operation &op : *step) {
@@ -2848,11 +3171,38 @@ struct SCFPrepCanonicalizeIVtoCmpLHS
 struct SCFPrepHoistLoopInvariant : public mlir::OpRewritePattern<cir::ForOp> {
   using mlir::OpRewritePattern<cir::ForOp>::OpRewritePattern;
 
-  bool isLoopInvariantLoad(mlir::Operation *op, cir::ForOp forOp) const {
+  bool isLoopInvariantLoad(mlir::Operation *op, cir::ForOp forOp,
+                           llvm::SmallVector<mlir::Operation *> &initOps) const {
     auto load = mlir::dyn_cast<cir::LoadOp>(op);
     if (!load)
       return false;
     mlir::Value loadAddr = load.getAddr();
+    // The load is only hoistable if its ADDRESS is available outside the
+    // loop too. An address defined inside the cond region (a cir.get_global,
+    // the common global-bound shape) must be hoisted WITH the load —
+    // hoisting the load alone leaves its operand behind and builds
+    // dominance-invalid IR (the aes `round_val + 9` bound crash class). Only
+    // a pure, symbol-based get_global is known-safe to move; any other
+    // in-region address producer blocks the hoist.
+    if (mlir::Operation *addrDef = loadAddr.getDefiningOp()) {
+      if (auto gg = mlir::dyn_cast<cir::GetGlobalOp>(addrDef)) {
+        // A GLOBAL bound is only provably loop-invariant when no call inside
+        // the loop can (transitively) store to it — an alloca-backed bound is
+        // immune (the no-store walk below covers every direct access, and a
+        // local's address is not visible to callees here). Refuse the hoist
+        // when a reachable callee might write the symbol.
+        if (globalMayBeWrittenInLoop(forOp, gg.getName()))
+          return false;
+        // A get_global inside the loop must be hoisted WITH the load:
+        // hoisting the load alone leaves its address operand behind and
+        // builds dominance-invalid IR (the aes `round_val + 9` bound class).
+        if (!addrDef->getParentRegion()->isAncestor(forOp->getParentRegion()))
+          initOps.push_back(addrDef);
+      } else if (!addrDef->getParentRegion()->isAncestor(
+                     forOp->getParentRegion())) {
+        return false; // in-loop non-global address producer: not hoistable.
+      }
+    }
     auto result = forOp->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation *o) {
       if (auto store = mlir::dyn_cast<cir::StoreOp>(o))
         if (store.getAddr() == loadAddr)
@@ -2866,7 +3216,8 @@ struct SCFPrepHoistLoopInvariant : public mlir::OpRewritePattern<cir::ForOp> {
                          llvm::SmallVector<mlir::Operation *> &initOps) const {
     if (!op)
       return false;
-    if (mlir::isa<cir::ConstantOp>(op) || isLoopInvariantLoad(op, forOp)) {
+    if (mlir::isa<cir::ConstantOp>(op) ||
+        isLoopInvariantLoad(op, forOp, initOps)) {
       initOps.push_back(op);
       return true;
     }
@@ -3189,6 +3540,45 @@ void ConvertCIRToMLIRPass::runOnOperation() {
       return;
     }
   }
+
+  // Hoist every `cir.get_global` out of loop CONDITION regions to its
+  // function's entry block. A get_global is a pure symbol-address
+  // computation (no memory effect, no operands), so the move is always
+  // sound, and it removes the address-producer-inside-cond shape that the
+  // general while lowering cannot remap safely (the load's converted base
+  // would be a doomed pure-type-conversion materialization of a value whose
+  // producer converts later — erased with a live user at applyRewrites).
+  theModule->walk([&](cir::GetGlobalOp gg) {
+    mlir::Region *r = gg->getParentRegion();
+    mlir::Operation *owner = r->getParentOp();
+    bool inCond = false;
+    while (owner && !mlir::isa<cir::FuncOp>(owner)) {
+      if (auto f = mlir::dyn_cast<cir::ForOp>(owner)) {
+        if (r == &f.getCond()) {
+          inCond = true;
+          break;
+        }
+      } else if (auto w = mlir::dyn_cast<cir::WhileOp>(owner)) {
+        if (r == &w.getCond()) {
+          inCond = true;
+          break;
+        }
+      } else if (auto d = mlir::dyn_cast<cir::DoWhileOp>(owner)) {
+        if (r == &d.getCond()) {
+          inCond = true;
+          break;
+        }
+      }
+      r = owner->getParentRegion();
+      owner = r->getParentOp();
+    }
+    if (!inCond)
+      return;
+    auto fn = gg->getParentOfType<cir::FuncOp>();
+    if (!fn || fn.getBody().empty())
+      return;
+    gg->moveBefore(&fn.getBody().front(), fn.getBody().front().begin());
+  });
 
   // SCF preparation (see patterns above): hoist loop bounds out of the cond
   // region + canonicalize the IV to the cmp LHS, before the conversion, so the

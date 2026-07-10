@@ -1,0 +1,25 @@
+// An ARRAY OF POINTERS (`int *arr[2]`) has no static single-base index form
+// (OUT row in v1). The cursor pass only models scalar `!cir.ptr<T>` slots, so
+// the aggregate alloca is left untouched; the downstream lowering owns
+// whatever honest reject or handling applies.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @arrptr() -> !s32i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 4>>
+    %t = cir.alloca "tab" align(16) : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 2>>
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %i = cir.const #cir.int<0> : !s32i
+    %e = cir.get_element %t[%i : !s32i] : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 2>> -> !cir.ptr<!cir.ptr<!s32i>>
+    cir.store align(8) %d, %e : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %0 = cir.load align(8) %e : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %1 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+    cir.return %1 : !s32i
+  }
+}
+
+// The pointer-array alloca and its element accesses are untouched.
+// CHECK: cir.alloca "tab" {{.*}} : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 2>>
+// CHECK: cir.get_element %{{.+}}[{{.*}}] : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 2>>

@@ -1,0 +1,30 @@
+// A ROW cursor over a 2-D array (`int (*rp)[4]`, unit = one row) rewrites to
+// a row-index slot with row-typed get_element materializations; the row's
+// element accesses chain off the materialized row pointer unchanged.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!row = !cir.array<!s32i x 4>
+module {
+  cir.func @rows() -> !s32i {
+    %m = cir.alloca "m" align(16) : !cir.ptr<!cir.array<!row x 3>>
+    %rp = cir.alloca "rp" align(8) : !cir.ptr<!cir.ptr<!row>>
+    %d = cir.cast array_to_ptrdecay %m : !cir.ptr<!cir.array<!row x 3>> -> !cir.ptr<!row>
+    cir.store align(8) %d, %rp : !cir.ptr<!row>, !cir.ptr<!cir.ptr<!row>>
+    %0 = cir.load align(8) %rp : !cir.ptr<!cir.ptr<!row>>, !cir.ptr<!row>
+    %k = cir.const #cir.int<1> : !s32i
+    %1 = cir.ptr_stride %0, %k : (!cir.ptr<!row>, !s32i) -> !cir.ptr<!row>
+    cir.store align(8) %1, %rp : !cir.ptr<!row>, !cir.ptr<!cir.ptr<!row>>
+    %2 = cir.load align(8) %rp : !cir.ptr<!cir.ptr<!row>>, !cir.ptr<!row>
+    %j = cir.const #cir.int<2> : !s32i
+    %3 = cir.get_element %2[%j : !s32i] : !cir.ptr<!row> -> !cir.ptr<!s32i>
+    %4 = cir.load align(4) %3 : !cir.ptr<!s32i>, !s32i
+    cir.return %4 : !s32i
+  }
+}
+
+// CHECK-NOT: !cir.ptr<!cir.ptr<!row>>
+// The row cursor materializes as a row-typed get_element on the 2-D root.
+// CHECK: %[[M:.+]] = cir.alloca "m"
+// CHECK: cir.get_element %[[M]][{{.*}}] : !cir.ptr<!cir.array<!cir.array<!s32i x 4> x 3>> -> !cir.ptr<!cir.array<!s32i x 4>>

@@ -1,0 +1,30 @@
+// A pointer slot whose OWN ADDRESS escapes (passed to a call) has a
+// non-enumerable access set: the pass must NOT rewrite it (never rewrite on
+// partial visibility) and leaves it untouched for the existing downstream
+// behaviour.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func private @scramble(!cir.ptr<!cir.ptr<!s32i>>)
+  cir.func @esc() -> !s32i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 8>>
+    %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    cir.store align(8) %d, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    cir.call @scramble(%p) : (!cir.ptr<!cir.ptr<!s32i>>) -> ()
+    %0 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %k = cir.const #cir.int<1> : !s32i
+    %1 = cir.ptr_stride %0, %k : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    cir.store align(8) %1, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %2 = cir.load deref align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %3 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    cir.return %3 : !s32i
+  }
+}
+
+// The slot survives untouched (address escape blocks the rewrite).
+// CHECK: cir.alloca "p" {{.*}} : !cir.ptr<!cir.ptr<!s32i>>
+// CHECK: cir.call @scramble
+// CHECK: cir.ptr_stride

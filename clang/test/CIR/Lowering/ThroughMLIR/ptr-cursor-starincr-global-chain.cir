@@ -1,0 +1,28 @@
+// A `*p++` SSA chain over a GLOBAL array collapses to get_element on a fresh
+// get_global of the same symbol (two get_globals of one symbol are
+// structurally identical roots).
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.global external @tq = #cir.const_array<[#cir.int<1> : !s32i, #cir.int<2> : !s32i, #cir.int<3> : !s32i, #cir.int<4> : !s32i]> : !cir.array<!s32i x 4>
+  cir.func @filter() -> !s32i {
+    %0 = cir.get_global @tq : !cir.ptr<!cir.array<!s32i x 4>>
+    %1 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    %5 = cir.const #cir.int<1> : !s32i
+    %6 = cir.ptr_stride %1, %5 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    %7 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+    %13 = cir.const #cir.int<1> : !s32i
+    %14 = cir.ptr_stride %6, %13 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    %15 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+    %20 = cir.add %7, %15 : !s32i
+    %23 = cir.load align(4) %14 : !cir.ptr<!s32i>, !s32i
+    %28 = cir.add %20, %23 : !s32i
+    cir.return %28 : !s32i
+  }
+}
+
+// CHECK: cir.get_global @tq
+// CHECK: cir.get_element %{{.+}}[{{.*}}] : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+// CHECK-NOT: cir.ptr_stride

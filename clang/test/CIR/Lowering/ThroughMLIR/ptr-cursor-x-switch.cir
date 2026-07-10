@@ -1,0 +1,76 @@
+// CROSS-FEATURE: pointer cursor x SWITCH. Cursor updates inside switch cases
+// (self-relative strides under nested regions) still reduce to the single
+// root, and the whole function lowers to memref/scf.
+//
+// C shape: switch(k){case 1: p++; break; case 2: p+=2; break; default:;} *p
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors --cir-flatten-scope-goto --cir-goto-solver --cir-canonicalize --cir-lower-break-continue --cir-lower-return --cir-canonicalize --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module {
+  cir.func  @f(%arg0: !s32i {llvm.noundef}) -> !s32i {
+    %0 = cir.alloca "k" align(4) init : !cir.ptr<!s32i>
+    %1 = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 8>>
+    %2 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+    cir.store %arg0, %0 : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %6 = cir.alloca "i" align(4) init : !cir.ptr<!s32i>
+      %7 = cir.const #cir.int<0> : !s32i
+      cir.store align(4) %7, %6 : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.const #cir.int<8> : !s32i
+        %10 = cir.cmp lt %8, %9 : !s32i
+        cir.condition(%10)
+      } body {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %10 = cir.cast integral %9 : !s32i -> !s64i
+        %11 = cir.get_element %1[%10 : !s64i] : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+        cir.store align(4) %8, %11 : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      } step {
+        %8 = cir.load align(4) %6 : !cir.ptr<!s32i>, !s32i
+        %9 = cir.inc nsw %8 : !s32i
+        cir.store align(4) %9, %6 : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %3 = cir.cast array_to_ptrdecay %1 : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    cir.store align(8) %3, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    cir.scope {
+      %6 = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      cir.switch(%6 : !s32i) {
+        cir.case(equal, [#cir.int<1> : !s32i]) {
+          %7 = cir.load align(8) %2 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+          %8 = cir.const #cir.int<1> : !s32i
+          %9 = cir.ptr_stride %7, %8 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+          cir.store align(8) %9, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+          cir.break
+        }
+        cir.case(equal, [#cir.int<2> : !s32i]) {
+          %7 = cir.const #cir.int<2> : !s32i
+          %8 = cir.load align(8) %2 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+          %9 = cir.ptr_stride %8, %7 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+          cir.store align(8) %9, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+          cir.break
+        }
+        cir.case(default, []) {
+          cir.break
+        }
+        cir.yield
+      }
+    }
+    %4 = cir.load deref align(8) %2 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %5 = cir.load align(4) %4 : !cir.ptr<!s32i>, !s32i
+    cir.return %5 : !s32i
+  }
+}
+
+
+// Fully lowered: no cir ops, no fat-pointer memrefs, integer loop machinery.
+// CHECK: func.func @f
+// CHECK-NOT: cir.
+// CHECK-NOT: memref<1xmemref
+// CHECK: return

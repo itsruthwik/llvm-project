@@ -291,6 +291,26 @@ void SCFLoop::analysis() {
     return;
   }
 
+  // The canonical scf.for lowering discards the cond/step regions and the
+  // IV alloca's per-iteration stores, so the alloca never holds the final
+  // IV value. Any use of the IV slot OUTSIDE the loop that is not strictly
+  // BEFORE it (a post-loop read like CHStone aes encrypt's
+  // `AddRoundKey(statemt, type, i)` after `for (i = 1; i <= ...; ++i)`)
+  // would read a STALE value — a silent wrong-code class (observed: aes
+  // main_result 32, and `for(i=0;i<5;i++); return s+i;` returning s+0).
+  // Such loops must take the general while path, which keeps the slot live.
+  for (mlir::Operation *user : ivAddr.getUsers()) {
+    if (forOp->isAncestor(user))
+      continue; // inside the loop: rewritten by the canonical lowering.
+    mlir::Operation *anc = user;
+    while (anc && anc->getBlock() != forOp->getBlock())
+      anc = anc->getParentOp();
+    if (!anc || !anc->isBeforeInBlock(forOp)) {
+      canonical = false;
+      return;
+    }
+  }
+
   cmpOp = findCmpOp();
   if (!cmpOp) {
     canonical = false;
@@ -303,8 +323,20 @@ void SCFLoop::analysis() {
     return;
   }
 
-  // The loop end value should be hoisted out of loop by -cir-mlir-scf-prepare.
-  // So we could get the value by getRemappedValue.
+  // The loop end value should be hoisted out of loop by the SCF-prepare
+  // patterns. A bound still DEFINED INSIDE the cond region (the prepare pass
+  // refused the hoist, e.g. a mutable-global bound whose symbol is written
+  // inside the loop) must force the non-canonical while path: the canonical
+  // scf.for lowering discards the cond region, and getRemappedValue would
+  // happily materialize a cast of the in-region value rather than returning
+  // null — producing an scf.for whose bound operand dies with the region
+  // (deferred-erase assertion / dominance-invalid IR).
+  if (mlir::Operation *rhsDef = cmpOp.getRhs().getDefiningOp()) {
+    if (forOp.getCond().isAncestor(rhsDef->getParentRegion())) {
+      canonical = false;
+      return;
+    }
+  }
   auto ivEndBound = rewriter->getRemappedValue(cmpOp.getRhs());
   // If the loop end bound is not loop invariant and can't be hoisted,
   // then this is not a canonical loop.

@@ -1,0 +1,65 @@
+// A global loop bound whose ADDRESS ESCAPES anywhere in the module
+// (`int *q = &N;` — the get_global is stored as a VALUE, outside the loop)
+// may be written through the alias inside the loop (`*q = 2;`), so the bound
+// load must NOT be hoisted even though no get_global @N inside the loop has
+// a write use. The escape check is MODULE-WIDE: any non-load user of any
+// get_global of the symbol makes it unhoistable; the loop takes the while
+// path and re-reads the bound every iteration (gescape probe: native 3, a
+// hoisted bound would count 5).
+//
+// RUN: cir-opt %s --cir-to-mlir | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.global external @N = #cir.int<5> : !s32i
+  cir.func @compute() -> !s32i {
+    %q = cir.alloca "q" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+    %g = cir.get_global @N : !cir.ptr<!s32i>
+    cir.store align(8) %g, %q : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %z = cir.const #cir.int<0> : !s32i
+    cir.store align(4) %z, %s : !s32i, !cir.ptr<!s32i>
+    cir.scope {
+      %i = cir.alloca "i" align(4) : !cir.ptr<!s32i>
+      %c0 = cir.const #cir.int<0> : !s32i
+      cir.store align(4) %c0, %i : !s32i, !cir.ptr<!s32i>
+      cir.for : cond {
+        %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+        %1 = cir.get_global @N : !cir.ptr<!s32i>
+        %2 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+        %3 = cir.cmp lt %0, %2 : !s32i
+        cir.condition(%3)
+      } body {
+        %0 = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+        %1 = cir.const #cir.int<1> : !s32i
+        %2 = cir.add %0, %1 : !s32i
+        cir.store align(4) %2, %s : !s32i, !cir.ptr<!s32i>
+        %3 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+        %4 = cir.const #cir.int<2> : !s32i
+        %5 = cir.cmp eq %3, %4 : !s32i
+        cir.if %5 {
+          %6 = cir.const #cir.int<2> : !s32i
+          %7 = cir.load align(8) %q : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+          cir.store align(4) %6, %7 : !s32i, !cir.ptr<!s32i>
+        }
+        cir.yield
+      } step {
+        %0 = cir.load align(4) %i : !cir.ptr<!s32i>, !s32i
+        %1 = cir.const #cir.int<1> : !s32i
+        %2 = cir.add %0, %1 : !s32i
+        cir.store align(4) %2, %i : !s32i, !cir.ptr<!s32i>
+        cir.yield
+      }
+    }
+    %r = cir.load align(4) %s : !cir.ptr<!s32i>, !s32i
+    cir.return %r : !s32i
+  }
+}
+
+// No scf.for; the while's BEFORE region re-reads the bound each iteration.
+// CHECK: func.func @compute
+// CHECK-NOT: scf.for
+// CHECK: scf.while
+// CHECK: memref.load
+// CHECK: arith.cmpi
+// CHECK: scf.condition

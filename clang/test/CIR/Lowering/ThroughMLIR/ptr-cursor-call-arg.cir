@@ -1,0 +1,27 @@
+// A cursor value passed to a CALL is materialized as a rooted get_element SSA
+// pointer at the call site.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func private @use(!cir.ptr<!s32i>) -> !s32i
+  cir.func @callarg() -> !s32i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 8>>
+    %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 8>> -> !cir.ptr<!s32i>
+    cir.store align(8) %d, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %0 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %k = cir.const #cir.int<2> : !s32i
+    %1 = cir.ptr_stride %0, %k : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    cir.store align(8) %1, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %2 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %3 = cir.call @use(%2) : (!cir.ptr<!s32i>) -> !s32i
+    cir.return %3 : !s32i
+  }
+}
+
+// CHECK-NOT: !cir.ptr<!cir.ptr<!s32i>>
+// CHECK: %[[A:.+]] = cir.alloca "a"
+// CHECK: %[[E:.+]] = cir.get_element %[[A]][{{.*}}]
+// CHECK: cir.call @use(%[[E]])

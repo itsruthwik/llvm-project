@@ -183,6 +183,40 @@ def LowerStructLocals : Pass<"cir-lower-struct-locals"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def LowerPointerCursors : Pass<"cir-lower-pointer-cursors"> {
+  let summary = "Lower provable pointer-cursor variables to (base, index) "
+                "form before cir-to-mlir";
+  let description = [{
+    Implements the unified pointer-provenance model (a C pointer value =
+    (base object, integer element index)) for the shapes it can PROVE:
+
+    - A fat-pointer `cir.alloca` slot (`!cir.ptr<T>`) surviving mem2reg whose
+      every use is a direct load/store and whose every stored value reduces to
+      a single structurally identical root (array alloca / stable get_global /
+      incoming pointer argument / struct-field pointer) plus an integer element
+      offset is rewritten into an INDEX slot: loads become materialized
+      `cir.get_element(root, idx)` pointers (so all consumers keep their exact
+      semantics), stores become signed index arithmetic (negative strides
+      supported), same-root pointer compares become integer index compares.
+    - An SSA `cir.ptr_stride` chain (`*p++` sequences) that reduces to a
+      concrete root is collapsed to a single `get_element(root, idx)`; such
+      chains could previously only reach an untranslatable fallback lowering.
+
+    SOUNDNESS: the pass is ADDITIVE and whole-slot-or-nothing. Any slot whose
+    access set is not fully enumerable (address escape), whose stored values do
+    not provably reduce (partial N-D row re-bases, element-size-changing
+    casts, unknown producers), or whose provenance is otherwise unresolvable
+    is LEFT UNTOUCHED for the existing downstream behaviour and its named
+    rejects. A slot that provably merges pointers into different base objects
+    (a different-base merge) is honestly rejected with a named diagnostic
+    (OUT in v1). Cross-root pointer compares are left as pointer compares so
+    the cir-to-mlir cross-allocation named reject, which owns that class,
+    fires on the now-visible provenance.
+  }];
+  let constructor = "mlir::createLowerPointerCursorsPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 def ScrubIO : Pass<"cir-scrub-io"> {
   let summary = "Discard console/file output calls for hardware synthesis";
   let description = [{

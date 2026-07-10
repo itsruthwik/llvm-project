@@ -1,0 +1,40 @@
+// A wrap-around cursor (`if (p >= end) p = start`) rewrites the reset to an
+// index store of 0 and the bound compare to an integer index compare.
+//
+// RUN: cir-opt %s --cir-lower-pointer-cursors | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func @wrap() -> !s32i {
+    %a = cir.alloca "a" align(16) : !cir.ptr<!cir.array<!s32i x 4>>
+    %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+    cir.store align(8) %d, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %0 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %k = cir.const #cir.int<1> : !s32i
+    %1 = cir.ptr_stride %0, %k : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+    cir.store align(8) %1, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    cir.scope {
+      %2 = cir.load align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+      %d2 = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+      %n = cir.const #cir.int<4> : !s32i
+      %e = cir.ptr_stride %d2, %n : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+      %c = cir.cmp ge %2, %e : !cir.ptr<!s32i>
+      cir.if %c {
+        %d3 = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+        cir.store align(8) %d3, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+      }
+    }
+    %3 = cir.load deref align(8) %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %4 = cir.load align(4) %3 : !cir.ptr<!s32i>, !s32i
+    cir.return %4 : !s32i
+  }
+}
+
+// CHECK-NOT: !cir.ptr<!cir.ptr<!s32i>>
+// The bound check is an index compare.
+// CHECK: cir.cmp ge %{{.+}}, %{{.+}} : !s32i
+// The reset stores index 0 back into the index slot.
+// CHECK: cir.if
+// CHECK: cir.const #cir.int<0> : !s32i
+// CHECK: cir.store {{.*}} : !s32i, !cir.ptr<!s32i>
