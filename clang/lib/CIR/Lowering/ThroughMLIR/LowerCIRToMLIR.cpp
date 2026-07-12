@@ -1011,7 +1011,19 @@ public:
       for (const auto &argType : enumerate(fnType.getInputs())) {
         auto convertedType = typeConverter->convertType(argType.value());
         if (!convertedType)
-          return mlir::failure();
+          // A bare failure() here leaves the cir.func unconverted; its body
+          // still partially lowers, and the driver later reports a misleading
+          // "unresolved materialization ... remained live" on the first block
+          // argument that HAD a conversion (a leaky, far-away diagnostic).
+          // Emit an honest named reject at the real site instead. The common
+          // trigger is a pointer-to-record parameter (e.g. `struct S *`), whose
+          // pointee has no memref element lowering.
+          return op.emitError()
+                 << "ThroughMLIR: function argument #" << argType.index()
+                 << " of type " << argType.value()
+                 << " has no standard/memref lowering (e.g. a pointer to a "
+                    "record or another unsupported aggregate) and is not "
+                    "supported yet";
         signatureConversion.addInputs(argType.index(), convertedType);
       }
 
@@ -1020,6 +1032,15 @@ public:
 
       mlir::Type resultType =
           getTypeConverter()->convertType(fnType.getReturnType());
+      // A void return legitimately converts to a null type (VoidType -> {}).
+      // A NON-void return that fails to convert must NOT be silently treated as
+      // void (that would build a wrong, result-dropping signature) — reject it.
+      if (!resultType && !mlir::isa<cir::VoidType>(fnType.getReturnType()))
+        return op.emitError()
+               << "ThroughMLIR: function result of type "
+               << fnType.getReturnType()
+               << " has no standard/memref lowering and is not void; "
+                  "unsupported result type";
       auto fn = mlir::func::FuncOp::create(
           rewriter, op.getLoc(), op.getName(),
           rewriter.getFunctionType(signatureConversion.getConvertedTypes(),

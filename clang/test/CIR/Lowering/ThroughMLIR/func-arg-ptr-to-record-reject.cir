@@ -1,0 +1,21 @@
+// CIRFuncOpLowering: a function argument whose type has no standard/memref
+// lowering — most commonly a pointer to a record (`struct S *`) — is honestly
+// rejected AT THE FUNCTION with a named diagnostic. Previously convertType
+// returned null and the pattern failed with a bare failure(), leaving the
+// cir.func unconverted; the body then partially lowered and the driver reported
+// a misleading "unresolved materialization ... remained live" on an unrelated
+// (scalar) block argument far from the real cause.
+//
+// RUN: not cir-opt %s --cir-to-mlir 2>&1 | FileCheck %s
+
+!u64i = !cir.int<u, 64>
+!rec_S = !cir.struct<"S" {!u64i, !u64i}>
+module {
+  // CHECK: function argument #0 of type '!cir.ptr<!cir.struct<"S" {{.*}}>>' has no standard/memref lowering
+  // (the type prints with its own surrounding single quotes, hence the '...' in the pattern)
+  cir.func @f(%arg0: !cir.ptr<!rec_S>, %arg1: !u64i) {
+    %0 = cir.alloca "s" align(8) : !cir.ptr<!u64i>
+    cir.store %arg1, %0 : !u64i, !cir.ptr<!u64i>
+    cir.return
+  }
+}
