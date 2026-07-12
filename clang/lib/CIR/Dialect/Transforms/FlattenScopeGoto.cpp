@@ -48,6 +48,8 @@
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/ControlFlowGuards.h"
 #include "clang/CIR/Dialect/Transforms/GotoClassify.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -121,12 +123,202 @@ struct FlattenScopeGotoPass
     }
   }
 
+  // Structurize a validated ForwardLadder (see GotoClassify.h): the function's
+  // body-level label blocks form a forward acyclic chain reachable only by goto.
+  // Lower it to a flag-guarded `cir.if` sequence, gated by a shared `tookGoto`
+  // flag, emitted just BEFORE block0's existing return (which stays as block0's
+  // terminator and is the natural "no goto taken" path). Returns false (and sets
+  // `failed`) if a dominance check makes the relocation unsafe.
+  //
+  //   dispatch gotos in block0  =>  store flag_L=true; store tookGoto=true;
+  //                                 climb-guard remaining block0 ops by tookGoto
+  //   before block0's return:   cir.if(tookGoto) {
+  //                               cir.if(flag_L1){ <L1 ops>; store flag_succ=true }
+  //                               ... (label blocks in region/topological order)
+  //                               cir.if(flag_Ln){ <Ln ops ending in cir.return> }
+  //                             }
+  //   original ^bbN label blocks are erased.
+  bool structurizeForwardLadder(cir::FuncOp func,
+                                const cir::ForwardLadderInfo &ladder) {
+    auto boolTy = cir::BoolType::get(&getContext());
+    mlir::Region &body = func.getBody();
+    mlir::Block *bodyBlock = &body.front();
+    auto loc = func.getLoc();
+    mlir::Operation *term0 = bodyBlock->getTerminator();
+
+    // Dominance safety: every value used inside a label block but defined OUTSIDE
+    // it must properly dominate block0's terminator (where the epilogue lands).
+    mlir::DominanceInfo dom(func);
+    for (mlir::Block *lb : ladder.blocks)
+      for (mlir::Operation &op : *lb)
+        for (mlir::Value v : op.getOperands()) {
+          mlir::Operation *def = v.getDefiningOp();
+          if (!def || def->getBlock() == lb)
+            continue; // func/block arg, or local to this label block
+          if (!dom.properlyDominates(def, term0))
+            return false; // unsafe to relocate -> caller rejects
+        }
+
+    // Spill the natural return value to a slot BEFORE any mutation. climbGuard
+    // will wrap block0's tail (including this store and the value's computation)
+    // into a `cir.if(!tookGoto)` guard, after which the value no longer dominates
+    // block0's terminator; we then reload the slot at the tail (the alloca
+    // dominates, and the tail return is reached only on the !tookGoto path where
+    // the guarded store has run). Works for ANY return operand (direct SSA or a
+    // load), unlike reading a pre-existing load's slot.
+    mlir::Value retSlot;
+    if (auto ret0 = mlir::dyn_cast<cir::ReturnOp>(term0);
+        ret0 && ret0.getNumOperands()) {
+      mlir::Type rty = ret0.getOperand(0).getType();
+      mlir::OpBuilder ab(bodyBlock, bodyBlock->begin());
+      retSlot = cir::AllocaOp::create(ab, loc, cir::PointerType::get(rty),
+                                      "ladder_natret", ab.getI64IntegerAttr(1));
+      mlir::OpBuilder sb(term0);
+      cir::StoreOp::create(sb, loc, ret0.getOperand(0), retSlot);
+    }
+
+    // One flag per label block + a shared tookGoto flag (all init false).
+    llvm::DenseMap<mlir::Block *, mlir::Value> flagFor;
+    for (mlir::Block *lb : ladder.blocks) {
+      auto name = mlir::cast<cir::LabelOp>(lb->front()).getLabel();
+      flagFor[lb] = makeFlag(bodyBlock, boolTy, ("ladder_" + name).str(), loc);
+    }
+    mlir::Value tookGoto = makeFlag(bodyBlock, boolTy, "ladder_took", loc);
+    llvm::DenseMap<llvm::StringRef, mlir::Block *> byName;
+    for (mlir::Block *lb : ladder.blocks)
+      byName[mlir::cast<cir::LabelOp>(lb->front()).getLabel()] = lb;
+
+    // Rewrite the DISPATCH gotos (those NOT a label block's own terminator).
+    llvm::SmallVector<cir::GotoOp> dispatch;
+    func.walk([&](cir::GotoOp g) {
+      mlir::Block *gb = g->getBlock();
+      if (cir::isLabelBlock(gb) && g.getOperation() == gb->getTerminator())
+        return; // chain-edge goto, handled during epilogue build
+      dispatch.push_back(g);
+    });
+    llvm::SmallSetVector<std::pair<mlir::Operation *, mlir::Value>, 4>
+        loopFlagPairs;
+    llvm::SmallVector<mlir::Operation *> anchors;
+    llvm::SmallVector<mlir::Block *> anchorEntry;
+    for (cir::GotoOp g : dispatch) {
+      cir::ScopeGotoInfo info = cir::classifyScopeGoto(g, func);
+      mlir::Block *labelBlock = info.label ? info.label->getBlock() : nullptr;
+      if (!labelBlock || !flagFor.count(labelBlock)) {
+        failed = true;
+        return false;
+      }
+      mlir::Block *entry = info.entryBlock ? info.entryBlock : bodyBlock;
+      // Record enclosing loops BEFORE any mutation (climb reshapes the region).
+      collectEnclosingLoops(g, entry, tookGoto, loopFlagPairs);
+      // set flag_target=true then tookGoto=true, in place.
+      mlir::OpBuilder b(g);
+      mlir::Value tv = cir::ConstantOp::create(
+          b, g.getLoc(), cir::BoolAttr::get(&getContext(), true));
+      cir::StoreOp::create(b, g.getLoc(), tv, flagFor[labelBlock]);
+      mlir::Operation *anchor = materializeGoto(g, tookGoto); // sets tookGoto
+      anchors.push_back(anchor);
+      anchorEntry.push_back(entry);
+    }
+    for (size_t i = 0; i < anchors.size(); ++i)
+      cir::climbGuard(anchors[i], tookGoto, boolTy, anchorEntry[i]);
+
+    // Build the epilogue inside cir.if(tookGoto), just before block0's return.
+    mlir::OpBuilder b(term0);
+    mlir::Value tg = cir::LoadOp::create(b, loc, boolTy, tookGoto);
+    auto ifTook = cir::IfOp::create(b, loc, tg, /*withElseRegion=*/false,
+                                    [](mlir::OpBuilder &, mlir::Location) {});
+    mlir::Block &tookThen = ifTook.getThenRegion().back();
+    mlir::OpBuilder tb(&tookThen, tookThen.end());
+    mlir::Operation *tookYield = cir::YieldOp::create(tb, loc);
+
+    for (mlir::Block *lb : ladder.blocks) {
+      mlir::OpBuilder gb(&tookThen, tookYield->getIterator());
+      mlir::Value fl = cir::LoadOp::create(gb, loc, boolTy, flagFor[lb]);
+      auto ifL = cir::IfOp::create(gb, loc, fl, /*withElseRegion=*/false,
+                                   [](mlir::OpBuilder &, mlir::Location) {});
+      mlir::Block &thenL = ifL.getThenRegion().back();
+      mlir::OpBuilder lb2(&thenL, thenL.end());
+      mlir::Operation *lYield = cir::YieldOp::create(lb2, loc);
+
+      // Clone L's ops (except leading cir.label and trailing terminator) into
+      // the guard, remapping intra-block SSA; external defs dominate.
+      mlir::IRMapping map;
+      mlir::Operation *term = lb->getTerminator();
+      for (mlir::Operation &op : *lb) {
+        if (mlir::isa<cir::LabelOp>(op) || &op == term)
+          continue;
+        lb2.setInsertionPoint(lYield);
+        lb2.clone(op, map);
+      }
+      // Chain edge: set successor flag; return: clone the return.
+      mlir::Block *succ = ladder.successor.lookup(lb);
+      lb2.setInsertionPoint(lYield);
+      if (succ) {
+        mlir::Value tv = cir::ConstantOp::create(
+            lb2, loc, cir::BoolAttr::get(&getContext(), true));
+        cir::StoreOp::create(lb2, loc, tv, flagFor[succ]);
+      } else if (auto ret = mlir::dyn_cast<cir::ReturnOp>(term)) {
+        lb2.clone(*ret.getOperation(), map);
+        lYield->erase(); // the cloned return terminates the guard region
+      }
+    }
+
+    // block0's natural `cir.return` is on the "no goto taken" path. climbGuard
+    // wrapped the ops computing its value into `cir.if(!tookGoto)`, so the value
+    // no longer dominates the block terminator. Relocate the return INTO that
+    // guard (as a nested early return, which lower-return consolidates) and give
+    // block0 a `cir.unreachable` terminator (every real path returns earlier).
+    if (retSlot) {
+      auto ret = mlir::cast<cir::ReturnOp>(term0);
+      mlir::Value rv = ret.getOperand(0);
+      mlir::OpBuilder tb(term0);
+      mlir::Value reload = cir::LoadOp::create(tb, loc, rv.getType(), retSlot);
+      ret.setOperand(0, reload); // read the spilled value at the (dominating) tail
+    }
+
+    // Erase the now-dead original label blocks (terminators first to drop edges).
+    for (mlir::Block *lb : ladder.blocks)
+      while (!lb->empty())
+        lb->back().erase();
+    for (mlir::Block *lb : ladder.blocks)
+      lb->erase();
+
+    // Strengthen loops that enclosed a dispatch goto (break out toward epilogue).
+    for (auto &lf : loopFlagPairs)
+      if (mlir::failed(cir::strengthenLoopExit(
+              lf.first, lf.second, boolTy,
+              "ThroughMLIR: loop enclosing a cross-scope 'goto' has no "
+              "structured condition region to strengthen"))) {
+        failed = true;
+        return false;
+      }
+    return true;
+  }
+
   void processFunc(cir::FuncOp func) {
     if (failed)
       return;
     mlir::Region &body = func.getBody();
     if (body.empty())
       return;
+
+    // A whole-function forward acyclic label chain (softfloat subFloat64Sigs) is
+    // structurized in one shot; its dispatch gotos would each classify as
+    // ForwardLadder. Handle it before the per-goto CleanForwardExit path.
+    cir::ForwardLadderInfo ladder = cir::analyzeForwardLadder(func);
+    if (ladder.valid) {
+      // The dominance guard inside structurizeForwardLadder runs BEFORE any
+      // mutation; a false result means the relocation is unsafe, so reject
+      // honestly (no half-transformed IR is left behind).
+      if (!structurizeForwardLadder(func, ladder)) {
+        func.emitError("ThroughMLIR: unsupported 'goto' (")
+            << cir::scopeGotoClassName(cir::ScopeGotoClass::MultiTargetLadder)
+            << "): a value used across the label chain does not dominate the "
+               "structurized epilogue";
+        failed = true;
+      }
+      return;
+    }
 
     // Collect every goto and classify. Reject the whole function on any
     // non-clean, non-top-level goto (honest, named diagnostic).

@@ -939,6 +939,12 @@ private:
       return rewriter.getFloatAttr(mlirType, floatAttr.getValue());
     } else if (auto intAttr = mlir::dyn_cast<cir::IntAttr>(cirAttr)) {
       return rewriter.getIntegerAttr(mlirType, intAttr.getValue());
+    } else if (mlir::isa<cir::UndefAttr>(cirAttr)) {
+      // An uninitialized value (`#cir.undef`) has no standard-dialect 'undef'.
+      // Lower it to a deterministic zero: a genuinely-observed undef would be UB
+      // in C, so on every defined path the value is dead or fully masked, and a
+      // fixed zero keeps the lowering reproducible (verified by the gcc-oracle).
+      return rewriter.getZeroAttr(mlirType);
     } else {
       // Unsupported constant attribute kind (e.g. data-member pointers or
       // indexed global-view initializers). Return null so matchAndRewrite emits

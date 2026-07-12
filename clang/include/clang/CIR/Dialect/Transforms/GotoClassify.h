@@ -51,6 +51,9 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Region.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace cir {
@@ -58,7 +61,8 @@ namespace cir {
 enum class ScopeGotoClass {
   NotNested,         // top-level goto -- GotoSolver handles it, not an error
   CleanForwardExit,  // flattenable single-epilogue forward exit
-  MultiTargetLadder, // softfloat subFloat64Sigs dispatch ladder (deferred)
+  ForwardLadder,     // flattenable multi-target forward acyclic label chain
+  MultiTargetLadder, // dispatch ladder that is NOT a clean forward chain (rejected)
   Backward,          // target block precedes the goto's entry block
   IntoScope,         // target label not at function-body-region level
   Unsupported        // missing label, cross-function, or unrecognised shape
@@ -72,8 +76,10 @@ inline llvm::StringRef scopeGotoClassName(ScopeGotoClass c) {
     return "top-level goto";
   case ScopeGotoClass::CleanForwardExit:
     return "clean forward-exit goto";
+  case ScopeGotoClass::ForwardLadder:
+    return "multi-target forward acyclic label chain (softfloat subFloat64Sigs)";
   case ScopeGotoClass::MultiTargetLadder:
-    return "multi-target forward dispatch (softfloat subFloat64Sigs ladder)";
+    return "multi-target forward dispatch (not a clean forward chain)";
   case ScopeGotoClass::Backward:
     return "backward goto";
   case ScopeGotoClass::IntoScope:
@@ -104,6 +110,98 @@ struct ScopeGotoInfo {
   mlir::Block *labelBlock = nullptr; // block that begins with the target label
   cir::LabelOp label = nullptr;      // the resolved target label op
 };
+
+// A ClangIR "label block" is a top-level block of the function-body region whose
+// first op is a `cir.label`.
+inline bool isLabelBlock(mlir::Block *b) {
+  return !b->empty() && mlir::isa<cir::LabelOp>(b->front());
+}
+
+// The result of analysing a whole function for the ForwardLadder shape: the
+// ordered label blocks and, per block, its single chain successor label block
+// (nullptr when the block exits via `cir.return`).
+struct ForwardLadderInfo {
+  bool valid = false;
+  llvm::SmallVector<mlir::Block *, 8> blocks;           // in region order
+  llvm::DenseMap<mlir::Block *, mlir::Block *> successor; // null => returns
+};
+
+// Validate that ALL of `func`'s function-body-level label blocks form a single
+// forward, acyclic chain that is reachable ONLY by goto/chain edges and carries
+// no cross-block SSA -- the generalised softfloat `subFloat64Sigs` shape that
+// FlattenScopeGoto can soundly structurize into a flag-guarded `cir.if`
+// sequence. Conservative: ANY deviation returns {valid=false} so the caller
+// falls back to the honest MultiTargetLadder reject.
+inline ForwardLadderInfo analyzeForwardLadder(cir::FuncOp func) {
+  ForwardLadderInfo out;
+  mlir::Region &body = func.getBody();
+  if (body.empty())
+    return out;
+
+  // Collect body-level label blocks, in order, with an index map.
+  llvm::DenseMap<mlir::Block *, int> index;
+  for (mlir::Block &b : body) {
+    if (isLabelBlock(&b)) {
+      index[&b] = static_cast<int>(out.blocks.size());
+      out.blocks.push_back(&b);
+    }
+  }
+  if (out.blocks.empty())
+    return out;
+
+  // Map label name -> label block (for goto-terminated chain edges).
+  llvm::DenseMap<llvm::StringRef, mlir::Block *> byName;
+  for (mlir::Block *b : out.blocks)
+    byName[mlir::cast<cir::LabelOp>(b->front()).getLabel()] = b;
+
+  for (mlir::Block *b : out.blocks) {
+    int bi = index[b];
+
+    // (1) No block arguments (a phi = genuine cross-block SSA merge).
+    if (b->getNumArguments() != 0)
+      return out;
+
+    // (2) Every CFG predecessor (via cir.br) must itself be a label block in the
+    // set -- i.e. the block is NOT the natural fall-through of ordinary code.
+    for (mlir::Block *pred : b->getPredecessors())
+      if (!index.count(pred))
+        return out;
+
+    // (3) No SSA value defined in this block may be used outside it (values from
+    // block0 / args that dominate are fine; a def escaping to a sibling label
+    // block would be non-dominating after restructuring).
+    for (mlir::Operation &op : *b)
+      for (mlir::Value res : op.getResults())
+        for (mlir::Operation *user : res.getUsers())
+          if (user->getBlock() != b)
+            return out;
+
+    // (4) Chain terminator: return (exit) or a FORWARD edge (br / top-level
+    // goto) to a strictly-later label block.
+    mlir::Operation *term = b->getTerminator();
+    if (mlir::isa<cir::ReturnOp>(term)) {
+      out.successor[b] = nullptr;
+      continue;
+    }
+    mlir::Block *succ = nullptr;
+    if (auto br = mlir::dyn_cast<cir::BrOp>(term)) {
+      if (br->getNumSuccessors() != 1)
+        return out;
+      succ = br->getSuccessor(0);
+    } else if (auto g = mlir::dyn_cast<cir::GotoOp>(term)) {
+      auto it = byName.find(g.getLabel());
+      succ = (it == byName.end()) ? nullptr : it->second;
+    } else {
+      return out; // any other terminator (switch, unreachable, ...) -> not a ladder
+    }
+    if (!succ || !index.count(succ) || index[succ] <= bi)
+      return out; // must be a forward edge to another label block
+    out.successor[b] = succ;
+  }
+
+  out.valid = true;
+  return out;
+}
 
 // Classify `gotoOp`. `func` must be its enclosing cir.func.
 inline ScopeGotoInfo classifyScopeGoto(cir::GotoOp gotoOp, cir::FuncOp func) {
@@ -180,6 +278,17 @@ inline ScopeGotoInfo classifyScopeGoto(cir::GotoOp gotoOp, cir::FuncOp func) {
   if (mlir::isa<cir::BrOp>(term) && term->getNumSuccessors() == 1 &&
       term->getSuccessor(0) == info.labelBlock) {
     info.cls = ScopeGotoClass::CleanForwardExit;
+    return info;
+  }
+
+  // Not a single clean epilogue. If the WHOLE function's label blocks form a
+  // valid forward acyclic chain (reachable only by goto, no cross-block SSA) and
+  // THIS goto targets one of them, it is a flattenable ForwardLadder. Otherwise
+  // it is the honest MultiTargetLadder reject.
+  ForwardLadderInfo ladder = analyzeForwardLadder(func);
+  if (ladder.valid && info.labelBlock &&
+      llvm::is_contained(ladder.blocks, info.labelBlock)) {
+    info.cls = ScopeGotoClass::ForwardLadder;
     return info;
   }
 
