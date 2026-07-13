@@ -1054,6 +1054,19 @@ public:
                                               : mlir::TypeRange()),
           passThroughAttrs);
 
+      // VTR-HLS: forward the declared array extent(s) of each parameter (the
+      // ClangIR CodeGen `cir.array_extent` attribute) onto the lowered func.func.
+      // The generic func lowering drops CIR arg attributes; this one must survive
+      // so the downstream `vtr-legalize-signatures` pass can retype the (dynamic)
+      // memref argument to a STATICALLY sized memref, which the handshake
+      // external-memory interface requires. Kept as an attribute (not applied to
+      // the type here) to avoid conflicting with cir-to-mlir's dynamic-memref
+      // pointer/get_element handling; the sizing happens once, at the std level.
+      for (unsigned i = 0, e = fn.getNumArguments(); i < e; ++i)
+        if (auto extent = op.getArgAttrOfType<mlir::DenseI64ArrayAttr>(
+                i, "cir.array_extent"))
+          fn.setArgAttr(i, "cir.array_extent", extent);
+
       if (failed(rewriter.convertRegionTypes(&op.getBody(), *typeConverter,
                                              &signatureConversion)))
         return mlir::failure();

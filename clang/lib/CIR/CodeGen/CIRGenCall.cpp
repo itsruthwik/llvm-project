@@ -766,6 +766,25 @@ void CIRGenModule::constructFunctionArgumentAttributes(
         argAttrList.set(mlir::LLVM::LLVMDialect::getNonNullAttrName(),
                         mlir::UnitAttr::get(&getMLIRContext()));
     }
+
+    // VTR-HLS: preserve the DECLARED array extent(s) of an array parameter. C
+    // adjusts `int a[64]` to `int *`, so the bound is lost in the (pointer)
+    // parameter type and in LLVM/CIR -- but the AST retains it via
+    // ParmVarDecl::getOriginalType(). Record the full declared shape as an i64
+    // array attribute (`cir.array_extent`) so the ThroughMLIR lowering can build
+    // a statically-sized `memref<NxT>` (required by the handshake external-memory
+    // interface) instead of a dynamic `memref<?xT>`. Definitions only.
+    if (!attrOnCallSite && pvd) {
+      QualType origTy = pvd->getOriginalType();
+      llvm::SmallVector<int64_t, 4> extents;
+      while (const auto *cat = getASTContext().getAsConstantArrayType(origTy)) {
+        extents.push_back(static_cast<int64_t>(cat->getSize().getZExtValue()));
+        origTy = cat->getElementType();
+      }
+      if (!extents.empty())
+        argAttrList.set("cir.array_extent",
+                        builder.getDenseI64ArrayAttr(extents));
+    }
   }
 }
 
