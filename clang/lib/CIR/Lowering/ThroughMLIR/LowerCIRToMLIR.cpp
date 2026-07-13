@@ -1062,10 +1062,15 @@ public:
       // external-memory interface requires. Kept as an attribute (not applied to
       // the type here) to avoid conflicting with cir-to-mlir's dynamic-memref
       // pointer/get_element handling; the sizing happens once, at the std level.
-      for (unsigned i = 0, e = fn.getNumArguments(); i < e; ++i)
+      for (unsigned i = 0, e = fn.getNumArguments(); i < e; ++i) {
         if (auto extent = op.getArgAttrOfType<mlir::DenseI64ArrayAttr>(
                 i, "cir.array_extent"))
           fn.setArgAttr(i, "cir.array_extent", extent);
+        // Forward the external memory-mapped interface depth (cir.axi_depth)
+        // likewise, so vtr-legalize-signatures can size an unsized pointer arg.
+        if (auto depth = op.getArgAttrOfType<mlir::IntegerAttr>(i, "cir.axi_depth"))
+          fn.setArgAttr(i, "cir.axi_depth", depth);
+      }
 
       if (failed(rewriter.convertRegionTypes(&op.getBody(), *typeConverter,
                                              &signatureConversion)))

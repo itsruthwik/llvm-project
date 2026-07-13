@@ -785,6 +785,27 @@ void CIRGenModule::constructFunctionArgumentAttributes(
         argAttrList.set("cir.array_extent",
                         builder.getDenseI64ArrayAttr(extents));
     }
+
+    // PROTOTYPE frontend for the `cir.axi_depth` contract. A pointer parameter
+    // annotated `__attribute__((annotate("vtr_axi_depth=N")))` declares the depth
+    // of the external memory-mapped interface it maps to (used downstream to size
+    // the unsized-pointer extmem interface / address bus). This attribute UX is a
+    // deliberately-greppable STAND-IN and must NOT ship: it will be replaced by a
+    // `#pragma HLS interface m_axi ... depth=N` handler producing the SAME
+    // `cir.axi_depth` attribute -- nothing downstream changes. See tracker item
+    // axi-depth-pragma-transition.
+    if (!attrOnCallSite && pvd) {
+      for (const auto *ann : pvd->specific_attrs<clang::AnnotateAttr>()) {
+        llvm::StringRef spec = ann->getAnnotation();
+        if (spec.consume_front("vtr_axi_depth=")) {
+          int64_t depth = 0;
+          if (!spec.getAsInteger(10, depth) && depth > 0) {
+            argAttrList.set("cir.axi_depth", builder.getI64IntegerAttr(depth));
+            break;
+          }
+        }
+      }
+    }
   }
 }
 
